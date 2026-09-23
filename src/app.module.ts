@@ -1,21 +1,25 @@
-import { Module } from '@nestjs/common';
-import { createObserveModule } from '@nestjs/observe';
+﻿import { Module } from '@nestjs/common';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
-
-export const { ObserveModule, ObserveInstrument } = createObserveModule();
-
+import { MongoService } from './mongo.service.js';
+import { PaymentsService } from './payments.service.js';
+import { PaymentsController } from './payments.controller.js';
+import { RazorpayService } from './razorpay.service.js';
+import { EmailService, EmailTransport } from './email.service.js';
+import { EmailController } from './email.controller.js';
+export function createStore() {
+  const uri =
+    process.env.MONGODB_URI || process.env.MONGO_URL || process.env.MONGO_URI;
+  return uri ? MongoService.connect(uri) : new AppService();
+}
 @Module({
-  imports: [
-    // Distributed tracing, auto-correlated logs, request/job metrics, error
-    // telemetry, alarms, and more — out of the box. Sign up at https://observe.nestjs.com
-    ObserveModule.forRoot({
-      appKey: 'YOUR_APP_KEY',
-      appSecret: 'YOUR_APP_SECRET',
-      serviceId: 'ticket-system-back',
-    }),
+  controllers: [AppController, PaymentsController, EmailController],
+  providers: [
+    { provide: AppService, useFactory: createStore },
+    PaymentsService,
+    RazorpayService,
+    EmailService,
+    EmailTransport,
   ],
-  controllers: [AppController],
-  providers: [AppService],
 })
 export class AppModule {}

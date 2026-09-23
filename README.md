@@ -1,118 +1,61 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Ticket System API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS API with SQLite persistence. Use Node.js 24.15+ (the Nest CLI's dependencies require this minimum). SQLite uses Node's built-in module.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Local setup
+```powershell
+npm.cmd install
+npm.cmd run setup
+npm.cmd run start:dev
+```
+Setup asks for an admin email, generates a strong password, prints it once, and writes only its scrypt hash to the ignored .env file. Save the password in a password manager. No default password is shipped. Existing .env files are never overwritten. API listens on 127.0.0.1:8000. Run the frontend separately on localhost:3000.
 
-## Description
+Database tables are created automatically at data/tickets.sqlite. Keep the database and .env private. Do not commit either. On Windows, configure filesystem ACLs for the service account; POSIX file modes do not enforce Windows permissions.
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
-
-```bash
-$ npm install
+## Validation
+```powershell
+npm.cmd run build
+npm.cmd test
+npm.cmd run test:e2e
+npm.cmd run lint
 ```
 
-## Compile and run the project
+## API
+- GET /api/health
+- POST /api/auth/login (email, password), GET /api/auth/me, POST /api/auth/logout
+- GET /api/events, GET /api/events/:id
+- POST /api/events (admin): name, startsAt (ISO timestamp), location, capacity, amount (integer paise; zero for free events)
+- POST /api/events/:id/registrations: name, email, phone
+- GET /api/registrations (admin, most recent 1,000)
 
-```bash
-# development
-$ npm run start
+Writes require application/json and an Origin exactly matching APP_ORIGIN. Browser requests go through the frontend's same-origin proxy. No permissive CORS is enabled.
 
-# watch mode
-$ npm run start:dev
+## Security and deployment
+Sessions are random opaque tokens, hashed in the database, expire after eight hours, and are revoked on logout. Cookies are HttpOnly, SameSite=Strict, and Secure in production. Passwords use scrypt. SQL uses bound parameters; registration capacity and uniqueness are checked inside a write transaction. The API validates input and requires Razorpay configuration for paid events.
 
-# production mode
-$ npm run start:prod
+For production set NODE_ENV=production, APP_ORIGIN=https://your-domain.example, a private DATABASE_PATH on a persistent disk, and the admin environment values. Build then run npm run start:prod. Terminate TLS at your trusted proxy and keep the API private. The default HOST is loopback; containers may need HOST=0.0.0.0 on a private network.
+
+Rate limiting uses the actual connection address, ignoring untrusted forwarded headers. With the Next.js proxy, callers share the proxy address and therefore share a conservative limit (10 login attempts and 60 other writes per 15 minutes). Before public launch, add trusted ingress per-client limits and tune these application limits; never blindly trust X-Forwarded-For. Limits persist in SQLite. Deploy a single API instance with local persistent storage; horizontal scaling needs a shared database and limiter.
+
+Next steps: production hosting/domain/TLS, tested database backups and restores, admin recovery/rotation and MFA, privacy/retention policy, email provider configuration, and load testing. Rotating the configured password does not revoke existing sessions automatically: delete session rows when rotating credentials. This is a development foundation, not an independent security certification.
+
+## MongoDB setup
+Save your MongoDB URI in **Ticket-System-Backend/.env** (not .env.example and not the frontend environment):
+
+```
+MONGODB_URI="mongodb+srv://YOUR_CONNECTION_STRING"
+MONGODB_DATABASE=ticket_system
 ```
 
-## Run tests
+MONGO_URL and MONGO_URI are accepted aliases. A configured MongoDB URI selects MongoDB for all events, registrations, sessions and rate limits; it never silently falls back on a connection failure. Without a URI, local SQLite remains available. MongoDB must be an Atlas cluster, replica set, or sharded cluster because registration uses a transaction to reserve a seat and save the attendee together. See https://www.mongodb.com/docs/drivers/node/v6.x/crud/transactions/.
 
-```bash
-# unit tests
-$ npm run test
+Run `npm.cmd run setup` after saving the file. It preserves existing MongoDB and other settings, prompts for your admin email if absent, and adds a generated password hash. It refuses to overwrite an existing password hash. Save the displayed password and restart `npm.cmd run start:dev` so the process reloads .env. A MongoDB URL is a database credential, not the admin login.
 
-# e2e tests
-$ npm run test:e2e
+For MongoDB deployments, back up the MongoDB database instead of the SQLite file. Existing SQLite records are not migrated automatically. Configure database user permissions and Atlas network access for the API host. Connection errors are deliberately generic to avoid leaking URI credentials. MongoDB session and rate-limit collections have TTL indexes; session expiry is also checked on every authenticated request. The rate limiter uses fixed windows and counts atomically in MongoDB.
 
-# test coverage
-$ npm run test:cov
-```
+## Razorpay
+Paid checkout, signed webhooks, ticket issuance, reconciliation and admin check-in are implemented. Read [PAYMENTS.md](PAYMENTS.md) for required keys, webhook setup, test-mode verification, refund behavior and known launch constraints.
 
-## Deployment
+## Ticket email
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Observability
-
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-This project is already instrumented. Create a free account at [observe.nestjs.com](https://observe.nestjs.com), add an application, and paste the generated app key and secret into the `ObserveModule.forRoot()` call in `src/app.module.ts`.
-
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Automatic confirmations and paid-ticket QR emails are implemented with a durable Resend queue. See [EMAIL.md](EMAIL.md) to configure a verified sender. GET /api/emails/status is admin-only.
