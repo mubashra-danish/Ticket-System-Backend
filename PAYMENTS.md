@@ -1,60 +1,59 @@
-# Razorpay payments and tickets
+# Direct UPI payments and admin approval
 
-## Configure locally
-Add these values to Ticket-System-Backend/.env. Keep secrets on the backend only:
+Razorpay is no longer used. Customers transfer money directly to the organizer's UPI account. This application does not charge a payment gateway fee or automatically verify bank credits. Any account/provider charges remain subject to your banking arrangement.
 
-```env
-RAZORPAY_KEY_ID=rzp_test_your_key_id
-RAZORPAY_KEY_SECRET=your_test_key_secret
-RAZORPAY_WEBHOOK_SECRET=a_separate_random_webhook_secret
+## Configure
+
+Set these backend `.env` values to your real receiving account, then restart the backend:
+
+```dotenv
+PAYMENT_UPI_ID=your-business@yourbank
+PAYMENT_PAYEE_NAME="Your business name"
 ```
 
-Restart the backend after changing .env. Without all three values, paid event creation and checkout are disabled; free registration still works. Use test-mode credentials first. Do not paste secrets into source code or the frontend environment.
+There is deliberately no default receiving account. Paid event creation and new paid bookings are disabled until these values are valid. Free registrations still work. Check the UPI ID and recipient name with a small transfer before publishing. Never put a PIN, OTP or bank password in these settings. Existing bookings keep the recipient details displayed when they were created.
 
-In Razorpay Dashboard, configure automatic payment capture and a webhook at:
+## Customer flow
 
-```
-https://YOUR_PUBLIC_DOMAIN/api/payments/razorpay/webhook
-```
+1. Enter attendee details. The server fixes the event price and creates a private booking with a 30-minute seat hold (or until the event starts).
+2. Scan the UPI QR or open the UPI app, check the recipient, and transfer the exact amount once.
+3. Enter the 12-digit UPI transaction reference (UTR/RRN). This is an unverified claim. No registration, ticket or confirmation email is issued yet.
+4. The customer sees a friendly awaiting-verification message. They can refresh status in the same browser tab. The page polls briefly and also has a manual status button.
+5. After approval, the ticket and printable admission QR appear. A durable confirmation email is queued in the same database transaction. Configure delivery using [EMAIL.md](EMAIL.md). If email is unavailable, the customer can print/save the ticket from this page.
 
-Subscribe to `payment.captured` and `refund.processed`. Use the same webhook secret as RAZORPAY_WEBHOOK_SECRET. The public website must forward /api to this backend. Localhost cannot receive external webhooks; use a trusted HTTPS development tunnel or a staging deployment. Test mode and live mode require their respective keys/webhook configuration.
+The private status token is stored in sessionStorage. It is not put into URLs or QR codes. Losing the browser session removes online status access; the customer should retain their booking reference and contact the organizer, or use their emailed ticket after approval. The booking reference alone cannot access a ticket.
 
-## What happens
-1. Admin creates an event with its price in rupees. The API stores an integer number of paise (500 rupees = 50000 paise). Zero remains free.
-2. The attendee supplies details. The server checks its own event price and availability, then reserves a seat for 15 minutes (or until event start, whichever is earlier).
-3. A durable booking exists before the server creates a Razorpay order. The order ID and public key are passed to Standard Checkout. Razorpay presents eligible UPI/card/payment options for the device and account.
-4. The browser callback is HMAC-verified using the stored order ID. The server fetches the payment from Razorpay, verifies order, amount, currency, capture and refund state, then atomically issues one ticket and registration.
-5. The raw-body-signed webhook invokes the same confirmation logic, even when the browser closes. Repeated callbacks/webhooks cannot create another registration or ticket.
-6. The page polls local booking state for up to a minute and provides a manual Check payment status action. A background reconciliation loop checks up to 25 pending orders per minute, oldest-check first, including expired holds. It runs only while the API process is up and payment keys are configured.
-7. The user can print/save the ticket QR. Admins can paste its contents or use a keyboard barcode reader at /admin/payments. Successful check-in is atomic and a second attempt fails. Camera scanning is not included. Ticket email delivery is available when configured; see [EMAIL.md](EMAIL.md).
+## Organizer verification
 
-The buyer's random access token is stored in sessionStorage to resume after refresh in the same browser tab. No attendee details or provider secrets are stored there. The token is a private capability, never included in URL parameters or the ticket QR. If the tab/session is lost, the checkout session cannot be restored by email; use the emailed QR (when configured) or save/print the issued ticket. Free registrations retain their original confirmation reference and do not get a paid-ticket QR.
+Open **Admin > Tickets & payments**. Independently open the receiving bank's transaction history and verify:
 
-## Failure and refund behavior
-- Active reservations count against capacity. Expired holds stop counting without deleting the financial record.
-- A failed/cancelled payment does not create a ticket. A buyer can retry the same provider order before the reservation expires.
-- An expired reservation can accept a late captured payment only when a seat remains available and the email has no confirmed registration. Otherwise it becomes PAYMENT_REVIEW, appears in the admin review queue, and receives no ticket. The organizer must arrange its refund in Razorpay Dashboard; the application does not automatically send refunds.
-- A verified full refund marks the booking REFUNDED, invalidates its ticket and removes its active registration. Refund processing is idempotent. A captured webhook replay cannot reactivate a refunded ticket. Partial refunds of an already issued ticket leave it valid; partial refunds before ticket issuance require manual investigation and do not issue a ticket.
-- A provider timeout during order creation is ambiguous. The application does not blindly create another order. The reservation expires, and the buyer can start a new booking after checking payment status. Webhooks can recover an order whose response was lost using its server-created receipt.
-- Only PENDING bookings are automatically reconciled. Refunds of already confirmed tickets depend on the signed refund webhook (or buyer-triggered status refresh). Monitor webhook delivery failures in Razorpay.
+- The credit actually reached the receiving account (not merely pending in the payer's app).
+- The 12-digit reference and exact amount match.
+- The recipient, payer identity and transaction date correspond to this booking. Contact the customer when the payer differs; do not accept someone else's transaction as theirs.
 
-## Storage and security
-Both SQLite and MongoDB persist bookings, ticket tokens and payment IDs. MongoDB requires a replica set/Atlas for transactions; per-event writes serialize competing reservations and confirmations. SQLite uses immediate write transactions. Unique provider order/payment indexes prevent accidental reassignment. Amounts come from the database, not the browser. A paid event cannot use the free-registration endpoint.
+Enter the bank reference and credited amount, record the payer/date in the verification note, check the bank-verification box, and approve. Notes and the admin identity/time are persisted with the decision. A verified reference is unique across all bookings, enforced by the database. Duplicate approvals issue only one ticket and one queued email. Unverified references are not globally reserved, so a false claim cannot squat on a legitimate reference.
 
-The webhook is the only browser-Origin exemption; it requires its own raw-body HMAC. Keep its exact URL above, configure HTTPS, and preserve the raw JSON body through proxies. API keys and webhook secrets are separate. Public ticket status requires the buyer capability; review and check-in require an admin session.
+Reject an unverifiable claim with a clear reason. The customer sees that reason; rejection releases the seat and cannot later be approved. Corrected claims require a new booking. Rejection does not refund a transfer. If money arrived, arrange the refund directly, inform the customer and retain the bank record.
 
-## Tests and launch checks
-- npm.cmd run build
-- npm.cmd test
-- npm.cmd run test:e2e
-- Frontend: npm.cmd run test:e2e
+Screenshots, SMS, a submitted reference and the customer's payment-success screen are not sufficient evidence. Manual review reduces risk but is not fraud-proof. The application has no bank access and cannot prove receipt automatically. Review promptly and protect admin access.
 
-Automated payment tests simulate Razorpay API/Checkout responses and use isolated SQLite. They cover signatures, amount/currency/order mismatch, duplicate callbacks, seat competition, expired holds, missed captures, full refund invalidation, and one-time check-in. Browser tests cover free registration and a simulated paid checkout through ticket issuance and admin check-in. They do not make real payments or prove your Razorpay account/MongoDB deployment configuration.
+The reference field uses the 12-digit RRN described in [NPCI's UPI account-statement specification](https://www.npci.org.in/PDF/npci/upi/circular/2018/UPI%20-%20Circular%20No.43.pdf). Customers should use that bank reference rather than an app's internal transaction ID.
 
-Before accepting real money, run a complete Razorpay test-mode transaction and webhook delivery against your configured MongoDB staging database, including refund delivery, dropped-browser recovery, simultaneous final-seat bookings and database restart. Confirm capture settings, refund policy, account activation, backups, webhook monitoring and trusted-ingress rate limits. The current application still uses conservative shared proxy rate limits, so tune them for expected attendance. Switch to live credentials only after those checks.
+## Availability, refunds and old bookings
 
-Official references:
-- https://razorpay.com/docs/payments/payment-gateway/web-integration/standard/integration-steps/
-- https://razorpay.com/docs/webhooks/validate-test/
-- https://razorpay.com/docs/api/payments/fetch-payments-orders/
-- https://razorpay.com/docs/webhooks/refunds/
+Pending and awaiting-approval bookings count against capacity only during their initial seat hold. Late payment references can still be reported. Approval checks current event availability atomically; it cannot oversell, override an existing registration, or issue after the event starts. If money is verified but a seat is unavailable, the booking stays in the review queue with no ticket or confirmation email. The organizer must arrange a refund outside the application and keep records. There is no automatic refund or refund-completion workflow.
+
+Historical payment records and already-issued tickets are retained. Old gateway bookings cannot be approved as manual UPI payments. The gateway callback/webhook/reconciliation routes have been removed: reconcile any outstanding gateway transfers and refunds in the former provider dashboard before switching an active deployment. Previously refunded tickets stay invalid; new external refunds are not automatically detected.
+
+Admission QR codes are random and accepted once, only for confirmed tickets. A copied valid QR could be used first by someone else, so ask guests to keep it private and check attendee identity when appropriate.
+
+## Storage and verification
+
+Both SQLite and MongoDB persist claims, decisions, confirmed payment references and tickets. Approval, seat assignment and email queuing share a transaction. MongoDB requires Atlas or a replica set for transactions. Test your deployed MongoDB configuration and email delivery before accepting real transfers.
+
+Automated checks:
+
+- Backend: `npm.cmd run build`, `npm.cmd test`, `npm.cmd run test:e2e`, `npm.cmd run lint`.
+- Frontend: `npm.cmd run build`, `npm.cmd run lint`, `npm.cmd run test:e2e`.
+
+Tests use isolated SQLite and simulated manual approval, not real bank transfers. They cover guest/admin boundaries, origin checks, duplicate claims/approvals/references, reservation expiry, no overselling, rejection, rollback when email queuing fails, and one-time admission. The browser test exercises the customer-to-admin-to-ticket flow.

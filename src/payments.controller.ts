@@ -31,23 +31,31 @@ export class PaymentsController {
   ) {
     return this.payments.status(body);
   }
-  @Post('payments/verify') @HttpCode(200) verify(
+  @Post('payments/submit') @HttpCode(200) submit(
     @Body() body: Record<string, unknown>,
   ) {
-    return this.payments.verify(body);
+    return this.payments.submit(body);
   }
   @Post('payments/refresh') @HttpCode(200) refresh(
     @Body() body: Record<string, unknown>,
   ) {
-    return this.payments.refresh(body);
+    return this.payments.status(body);
   }
-  @Post('payments/razorpay/webhook') @HttpCode(200) webhook(
-    @Req() req: Request & { rawBody?: Buffer },
+  @Post('payments/:id/approve') @HttpCode(200) async approve(
+    @Req() req: Request,
+    @Param('id') id: string,
+    @Body() body: Record<string, unknown>,
   ) {
-    return this.payments.webhook(
-      req.rawBody,
-      req.headers['x-razorpay-signature'],
-    );
+    await this.admin(req);
+    return this.payments.approve(id, body, process.env.ADMIN_EMAIL || 'admin');
+  }
+  @Post('payments/:id/reject') @HttpCode(200) async reject(
+    @Req() req: Request,
+    @Param('id') id: string,
+    @Body() body: Record<string, unknown>,
+  ) {
+    await this.admin(req);
+    return this.payments.reject(id, body, process.env.ADMIN_EMAIL || 'admin');
   }
   @Get('payments/review') async review(@Req() req: Request) {
     await this.admin(req);

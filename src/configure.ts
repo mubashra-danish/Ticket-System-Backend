@@ -16,9 +16,6 @@ export function configure(app: NestExpressApplication) {
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Referrer-Policy', 'no-referrer');
-    // Server-to-server delivery has no browser Origin. The controller requires a valid raw-body HMAC.
-    if (req.method === 'POST' && req.path === '/api/payments/razorpay/webhook')
-      return next();
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       if (req.headers.origin !== origin || !req.is('application/json'))
         return res

@@ -4,7 +4,6 @@ import { AppService } from './app.service.js';
 import { MongoService } from './mongo.service.js';
 import { PaymentsService } from './payments.service.js';
 import { PaymentsController } from './payments.controller.js';
-import { RazorpayService } from './razorpay.service.js';
 import { EmailService, EmailTransport } from './email.service.js';
 import { EmailController } from './email.controller.js';
 export function createStore() {
@@ -17,7 +16,6 @@ export function createStore() {
   providers: [
     { provide: AppService, useFactory: createStore },
     PaymentsService,
-    RazorpayService,
     EmailService,
     EmailTransport,
   ],

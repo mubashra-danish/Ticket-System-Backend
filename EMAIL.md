@@ -1,6 +1,6 @@
 ﻿# Ticket email setup
 
-New free registrations queue a confirmation; verified paid bookings queue event details and an attached ticket QR (`ticket.png`). The template uses the site's cream and blue palette. Both MongoDB and SQLite queue the message inside the registration transaction. Existing registrations are not backfilled.
+New free registrations queue a confirmation; admin-approved paid bookings queue event details and an attached ticket QR (`ticket.png`). The template uses the site's cream and blue palette. Both MongoDB and SQLite queue the message inside the registration transaction. Existing registrations are not backfilled.
 
 ## Activate delivery
 
@@ -15,9 +15,9 @@ EMAIL_TIMEZONE=Asia/Kolkata
 ```
 
 3. Restart the backend. Pending messages are processed at startup and every 15 seconds, including messages queued while delivery was disabled.
-4. Make a registration using your own address. For paid tickets, complete a verified Razorpay test payment. Check **Admin > Tickets & payments > Ticket emails** and your inbox/spam folder.
+4. Make a registration using your own address. For paid tickets, submit a UPI reference and approve it from Admin > Tickets & payments after checking the receiving account. Check **Admin > Tickets & payments > Ticket emails** and your inbox/spam folder.
 
-Resend's free plan currently includes 3,000 emails/month with a 100/day limit: https://resend.com/pricing/ . Domain registration may cost money. Resend's testing sender cannot send unrestricted production mail; use a verified sender domain.
+Check current sending allowances at https://resend.com/pricing/ before enabling delivery. Domain registration may cost money. Resend's testing sender cannot send unrestricted production mail; use a verified sender domain.
 
 ## Delivery behavior
 

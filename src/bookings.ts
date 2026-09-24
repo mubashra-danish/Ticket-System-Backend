@@ -1,5 +1,6 @@
 import { ConflictException, NotFoundException } from '@nestjs/common';
 import type { EventRow } from './app.service.js';
+import type { Decision, PaymentInstructions } from './manual-payments.js';
 export type Booking = {
   id: string;
   accessHash: string;
@@ -10,7 +11,17 @@ export type Booking = {
   phone: string;
   amount: number;
   currency: 'INR';
-  status: 'PENDING' | 'PAID' | 'PAYMENT_REVIEW' | 'REFUNDED';
+  status:
+    | 'PENDING'
+    | 'AWAITING_APPROVAL'
+    | 'REJECTED'
+    | 'PAID'
+    | 'PAYMENT_REVIEW'
+    | 'REFUNDED';
+  manualPayment?: PaymentInstructions;
+  submittedReference?: string;
+  submittedAt?: number;
+  decision?: Decision;
   createdAt: number;
   expiresAt: number;
   lastChecked: number;
@@ -20,24 +31,17 @@ export type Booking = {
   checkedInAt: number | null;
   reviewReason: string | null;
 };
-export type Payment = {
-  id: string;
-  order_id: string;
-  amount: number;
-  currency: string;
-  status: string;
-  amount_refunded?: number;
-};
 export interface BookingStore {
   reserve(input: Booking): Promise<{ booking: Booking; created: boolean }>;
   get(id: string): Promise<Booking | null>;
-  byOrder(orderId: string): Promise<Booking | null>;
-  attach(id: string, orderId: string): Promise<void>;
-  finish(id: string, payment: Payment, ticketToken: string): Promise<Booking>;
-  pending(): Promise<Booking[]>;
-  checked(id: string): Promise<void>;
+  approve(
+    id: string,
+    decision: Decision,
+    ticketToken: string,
+  ): Promise<Booking>;
+  submit(id: string, reference: string): Promise<Booking>;
+  reject(id: string, decision: Decision): Promise<Booking>;
   review(): Promise<Booking[]>;
-  refund(id: string, paymentId: string): Promise<Booking>;
   checkin(token: string): Promise<Booking>;
 }
 export function reservation(
@@ -75,7 +79,7 @@ export function reservation(
     );
 }
 export function canIssue(event: EventRow, held: number, duplicate: boolean) {
-  // A late capture may reclaim a free seat, but never a seat held by another checkout.
+  // A late approval may use a free seat, but never one held by another booking.
   return (
     Date.parse(event.startsAt) > Date.now() &&
     !duplicate &&

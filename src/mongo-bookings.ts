@@ -2,13 +2,18 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import type { Db, MongoClient, ClientSession } from 'mongodb';
 import type { EventRow } from './app.service.js';
 import type { MongoEmailOutbox } from './mongo-email-outbox.js';
+import {
+  approveClaim,
+  submitClaim,
+  rejectClaim,
+  type Decision,
+} from './manual-payments.js';
 import { emailJob } from './email-outbox.js';
 import {
   reservation,
   canIssue,
   type Booking,
   type BookingStore,
-  type Payment,
 } from './bookings.js';
 export class MongoBookings implements BookingStore {
   constructor(
@@ -58,7 +63,7 @@ export class MongoBookings implements BookingStore {
       {
         eventId,
         id: { $ne: except },
-        status: 'PENDING',
+        status: { $in: ['PENDING', 'AWAITING_APPROVAL'] },
         expiresAt: { $gt: Date.now() },
       },
       { session },
@@ -76,7 +81,9 @@ export class MongoBookings implements BookingStore {
           eventId: input.eventId,
           email: input.email,
           $or: [
-            { status: { $in: ['PAID', 'PAYMENT_REVIEW'] } },
+            {
+              status: { $in: ['PAID', 'PAYMENT_REVIEW', 'AWAITING_APPROVAL'] },
+            },
             { status: 'PENDING', expiresAt: { $gt: Date.now() } },
           ],
         },
@@ -96,35 +103,34 @@ export class MongoBookings implements BookingStore {
   async get(id: string) {
     return this.rows.findOne({ id }, { projection: { _id: 0 } });
   }
-  async byOrder(orderId: string) {
-    return this.rows.findOne({ orderId }, { projection: { _id: 0 } });
-  }
-  async attach(id: string, orderId: string) {
-    const result = await this.rows.updateOne(
-      { id, $or: [{ orderId: null }, { orderId }] },
-      { $set: { orderId } },
-    );
-    if (!result.matchedCount)
-      throw new ConflictException('Order already assigned');
-  }
-  async finish(id: string, p: Payment, ticketToken: string) {
+  async approve(id: string, decision: Decision, ticketToken: string) {
     return this.transaction(async (session) => {
       const b = await this.rows.findOne({ id }, { session });
       if (!b) throw new NotFoundException();
       const event = await this.lock(b.eventId, session);
-      if (b.status !== 'PENDING') {
-        if (b.paymentId !== p.id)
-          throw new ConflictException('Payment already assigned');
+      approveClaim(b, decision);
+      const paymentId = 'upi:' + decision.reference;
+      if (b.status === 'PAID' || b.status === 'PAYMENT_REVIEW') {
         return b;
       }
       const duplicate = !!(await this.db
         .collection('registrations')
         .findOne({ eventId: b.eventId, email: b.email }, { session }));
-      b.paymentId = p.id;
+      if (
+        await this.rows.findOne(
+          { paymentId: paymentId, id: { $ne: id } },
+          { session },
+        )
+      )
+        throw new ConflictException(
+          'This bank reference has already been used for another booking.',
+        );
+      b.paymentId = paymentId;
       if (
         canIssue(event, await this.held(b.eventId, b.id, session), duplicate)
       ) {
         b.status = 'PAID';
+        b.reviewReason = null;
         b.ticketToken = ticketToken;
         await this.outbox.enqueue(emailJob(event, b, ticketToken), session);
         await this.db.collection('registrations').insertOne(
@@ -149,7 +155,7 @@ export class MongoBookings implements BookingStore {
       } else {
         b.status = 'PAYMENT_REVIEW';
         b.reviewReason =
-          'Payment captured after availability changed. Organizer must arrange a refund.';
+          'The payment was verified, but a seat is no longer available. Please contact the organizer to arrange a refund. Do not pay again.';
       }
       await this.rows.updateOne(
         { id },
@@ -159,6 +165,7 @@ export class MongoBookings implements BookingStore {
             paymentId: b.paymentId,
             ticketToken: b.ticketToken,
             reviewReason: b.reviewReason,
+            ...(b.decision ? { decision: b.decision } : {}),
           },
         },
         { session },
@@ -166,53 +173,43 @@ export class MongoBookings implements BookingStore {
       return b;
     });
   }
-  async pending() {
-    return this.rows
-      .find({ status: 'PENDING', orderId: { $type: 'string' } })
-      .sort({ lastChecked: 1 })
-      .limit(25)
-      .toArray();
-  }
-  async checked(id: string) {
-    await this.rows.updateOne({ id }, { $set: { lastChecked: Date.now() } });
-  }
-  async review() {
-    return this.rows
-      .find({ status: 'PAYMENT_REVIEW' }, { projection: { _id: 0 } })
-      .sort({ createdAt: -1 })
-      .limit(1000)
-      .toArray();
-  }
-  async refund(id: string, paymentId: string) {
+  private async updateClaim(id: string, change: (b: Booking) => void) {
     return this.transaction(async (session) => {
       const b = await this.rows.findOne({ id }, { session });
       if (!b) throw new NotFoundException();
       await this.lock(b.eventId, session);
-      if (b.paymentId && b.paymentId !== paymentId)
-        throw new ConflictException('Payment already assigned');
-      if (b.status === 'PAID') {
-        await this.db
-          .collection('registrations')
-          .deleteOne({ id: b.id }, { session });
-        await this.db
-          .collection<EventRow>('events')
-          .updateOne(
-            { id: b.eventId },
-            { $inc: { registered: -1 } },
-            { session },
-          );
-      }
-      b.status = 'REFUNDED';
-      b.paymentId = paymentId;
-      b.reviewReason =
-        'Payment fully refunded. This ticket is no longer valid.';
+      change(b);
       await this.rows.updateOne(
         { id },
-        { $set: { status: b.status, paymentId, reviewReason: b.reviewReason } },
+        {
+          $set: {
+            status: b.status,
+            submittedReference: b.submittedReference,
+            submittedAt: b.submittedAt,
+            reviewReason: b.reviewReason,
+            ...(b.decision ? { decision: b.decision } : {}),
+          },
+        },
         { session },
       );
       return b;
     });
+  }
+  submit(id: string, reference: string) {
+    return this.updateClaim(id, (b) => submitClaim(b, reference));
+  }
+  reject(id: string, decision: Decision) {
+    return this.updateClaim(id, (b) => rejectClaim(b, decision));
+  }
+  async review() {
+    return this.rows
+      .find(
+        { status: { $in: ['PAYMENT_REVIEW', 'AWAITING_APPROVAL'] } },
+        { projection: { _id: 0 } },
+      )
+      .sort({ createdAt: -1 })
+      .limit(1000)
+      .toArray();
   }
   async checkin(token: string) {
     const b = await this.rows.findOneAndUpdate(

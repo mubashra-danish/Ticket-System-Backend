@@ -21,7 +21,7 @@ import { promisify } from 'node:util';
 import { SqliteBookings } from './sqlite-bookings.js';
 import { SqliteEmailOutbox } from './sqlite-email-outbox.js';
 import { emailJob } from './email-outbox.js';
-import { paymentsConfigured } from './razorpay.service.js';
+import { paymentInstructions } from './manual-payments.js';
 export function eventAmount(value: unknown) {
   const amount = value ?? 0;
   if (
@@ -34,9 +34,9 @@ export function eventAmount(value: unknown) {
     throw new BadRequestException(
       'Price must be zero or between INR 1 and INR 100,000, in paise',
     );
-  if (amount > 0 && !paymentsConfigured())
+  if (amount > 0 && !paymentInstructions())
     throw new BadRequestException(
-      'Configure the payment provider before publishing a paid event',
+      'Configure UPI payment settings: PAYMENT_UPI_ID and PAYMENT_PAYEE_NAME before publishing a paid event',
     );
   return amount;
 }

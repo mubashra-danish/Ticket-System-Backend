@@ -2,13 +2,18 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import type { DatabaseSync } from 'node:sqlite';
 import type { EventRow } from './app.service.js';
 import type { SqliteEmailOutbox } from './sqlite-email-outbox.js';
+import {
+  approveClaim,
+  submitClaim,
+  rejectClaim,
+  type Decision,
+} from './manual-payments.js';
 import { emailJob } from './email-outbox.js';
 import {
   reservation,
   canIssue,
   type Booking,
   type BookingStore,
-  type Payment,
 } from './bookings.js';
 export class SqliteBookings implements BookingStore {
   constructor(
@@ -52,7 +57,7 @@ export class SqliteBookings implements BookingStore {
     return (
       this.db
         .prepare(
-          "SELECT COUNT(*) AS n FROM bookings WHERE eventId=? AND id!=? AND status='PENDING' AND expiresAt>?",
+          "SELECT COUNT(*) AS n FROM bookings WHERE eventId=? AND id!=? AND status IN ('PENDING','AWAITING_APPROVAL') AND expiresAt>?",
         )
         .get(eventId, except, Date.now()) as { n: number }
     ).n;
@@ -65,7 +70,7 @@ export class SqliteBookings implements BookingStore {
       );
       const duplicate = !!this.db
         .prepare(
-          "SELECT 1 FROM registrations WHERE eventId=? AND email=? UNION ALL SELECT 1 FROM bookings WHERE eventId=? AND email=? AND (status IN ('PAID','PAYMENT_REVIEW') OR (status='PENDING' AND expiresAt>?))",
+          "SELECT 1 FROM registrations WHERE eventId=? AND email=? UNION ALL SELECT 1 FROM bookings WHERE eventId=? AND email=? AND (status IN ('PAID','PAYMENT_REVIEW','AWAITING_APPROVAL') OR (status='PENDING' AND expiresAt>?))",
         )
         .get(
           input.eventId,
@@ -94,39 +99,16 @@ export class SqliteBookings implements BookingStore {
       this.db.prepare('SELECT data FROM bookings WHERE id=?').get(id),
     );
   }
-  async byOrder(orderId: string) {
-    return this.read(
-      this.db.prepare('SELECT data FROM bookings WHERE orderId=?').get(orderId),
-    );
-  }
-  async attach(id: string, orderId: string) {
-    // No await inside SQLite transactions.
+  async approve(id: string, decision: Decision, ticketToken: string) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const b = this.read(
         this.db.prepare('SELECT data FROM bookings WHERE id=?').get(id),
       );
       if (!b) throw new NotFoundException();
-      if (b.orderId && b.orderId !== orderId)
-        throw new ConflictException('Order already assigned');
-      b.orderId = orderId;
-      this.save(b);
-      this.db.exec('COMMIT');
-    } catch (e) {
-      this.db.exec('ROLLBACK');
-      throw e;
-    }
-  }
-  async finish(id: string, p: Payment, ticketToken: string) {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const b = this.read(
-        this.db.prepare('SELECT data FROM bookings WHERE id=?').get(id),
-      );
-      if (!b) throw new NotFoundException();
-      if (b.status !== 'PENDING') {
-        if (b.paymentId !== p.id)
-          throw new ConflictException('Payment already assigned');
+      approveClaim(b, decision);
+      const paymentId = 'upi:' + decision.reference;
+      if (b.status === 'PAID' || b.status === 'PAYMENT_REVIEW') {
         this.db.exec('COMMIT');
         return b;
       }
@@ -135,9 +117,18 @@ export class SqliteBookings implements BookingStore {
       const duplicate = !!this.db
         .prepare('SELECT 1 FROM registrations WHERE eventId=? AND email=?')
         .get(b.eventId, b.email);
-      b.paymentId = p.id;
+      if (
+        this.db
+          .prepare('SELECT 1 FROM bookings WHERE paymentId=? AND id!=?')
+          .get(paymentId, id)
+      )
+        throw new ConflictException(
+          'This bank reference has already been used for another booking.',
+        );
+      b.paymentId = paymentId;
       if (canIssue(event, this.held(b.eventId, b.id), duplicate)) {
         b.status = 'PAID';
+        b.reviewReason = null;
         b.ticketToken = ticketToken;
         this.outbox.enqueue(emailJob(event, b, ticketToken));
         this.db
@@ -153,7 +144,7 @@ export class SqliteBookings implements BookingStore {
       } else {
         b.status = 'PAYMENT_REVIEW';
         b.reviewReason =
-          'Payment captured after availability changed. Organizer must arrange a refund.';
+          'The payment was verified, but a seat is no longer available. Please contact the organizer to arrange a refund. Do not pay again.';
       }
       this.save(b);
       this.db.exec('COMMIT');
@@ -163,45 +154,14 @@ export class SqliteBookings implements BookingStore {
       throw e;
     }
   }
-  async pending() {
-    return this.db
-      .prepare(
-        "SELECT data FROM bookings WHERE status='PENDING' AND orderId IS NOT NULL ORDER BY lastChecked LIMIT 25",
-      )
-      .all()
-      .map((r) => this.read(r)!);
-  }
-  async checked(id: string) {
-    const now = Date.now();
-    this.db
-      .prepare(
-        "UPDATE bookings SET lastChecked=?,data=json_set(data,'$.lastChecked',?) WHERE id=?",
-      )
-      .run(now, now, id);
-  }
-  async review() {
-    return this.db
-      .prepare(
-        "SELECT data FROM bookings WHERE status='PAYMENT_REVIEW' ORDER BY lastChecked DESC LIMIT 1000",
-      )
-      .all()
-      .map((r) => this.read(r)!);
-  }
-  async refund(id: string, paymentId: string) {
+  private async updateClaim(id: string, change: (b: Booking) => void) {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const b = this.read(
         this.db.prepare('SELECT data FROM bookings WHERE id=?').get(id),
       );
       if (!b) throw new NotFoundException();
-      if (b.paymentId && b.paymentId !== paymentId)
-        throw new ConflictException('Payment already assigned');
-      if (b.status === 'PAID')
-        this.db.prepare('DELETE FROM registrations WHERE id=?').run(b.id);
-      b.status = 'REFUNDED';
-      b.paymentId = paymentId;
-      b.reviewReason =
-        'Payment fully refunded. This ticket is no longer valid.';
+      change(b);
       this.save(b);
       this.db.exec('COMMIT');
       return b;
@@ -209,6 +169,20 @@ export class SqliteBookings implements BookingStore {
       this.db.exec('ROLLBACK');
       throw e;
     }
+  }
+  submit(id: string, reference: string) {
+    return this.updateClaim(id, (b) => submitClaim(b, reference));
+  }
+  reject(id: string, decision: Decision) {
+    return this.updateClaim(id, (b) => rejectClaim(b, decision));
+  }
+  async review() {
+    return this.db
+      .prepare(
+        "SELECT data FROM bookings WHERE status IN ('PAYMENT_REVIEW','AWAITING_APPROVAL') ORDER BY lastChecked DESC LIMIT 1000",
+      )
+      .all()
+      .map((r) => this.read(r)!);
   }
   async checkin(token: string) {
     this.db.exec('BEGIN IMMEDIATE');

@@ -1,44 +1,31 @@
-﻿import 'reflect-metadata';
+import 'reflect-metadata';
 import { Test } from '@nestjs/testing';
 import type { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
-import { createHmac, randomBytes } from 'node:crypto';
+import { randomBytes, scryptSync } from 'node:crypto';
 import { AppModule } from '../src/app.module.js';
 import { AppService } from '../src/app.service.js';
-import { RazorpayService } from '../src/razorpay.service.js';
 import { configure } from '../src/configure.js';
-describe('payment HTTP boundary', () => {
+
+describe('manual payment HTTP boundary', () => {
   let app: NestExpressApplication, store: AppService;
+  const origin = 'http://localhost:3000';
   beforeEach(async () => {
+    for (const key of ['MONGODB_URI', 'MONGO_URL', 'MONGO_URI'])
+      vi.stubEnv(key, '');
     vi.stubEnv('DATABASE_PATH', ':memory:');
-    vi.stubEnv('MONGODB_URI', '');
-    vi.stubEnv('MONGO_URL', '');
-    vi.stubEnv('MONGO_URI', '');
-    vi.stubEnv('APP_ORIGIN', 'http://localhost:3000');
-    vi.stubEnv('RAZORPAY_KEY_ID', 'rzp_test_example');
-    vi.stubEnv('RAZORPAY_KEY_SECRET', 'test-secret');
-    vi.stubEnv('RAZORPAY_WEBHOOK_SECRET', 'webhook-secret');
-    const module = await Test.createTestingModule({ imports: [AppModule] })
-      .overrideProvider(RazorpayService)
-      .useValue({
-        create: async (b: { id: string; amount: number }) => ({
-          id: 'order_http',
-          receipt: b.id,
-          amount: b.amount,
-          currency: 'INR',
-        }),
-        payment: async () => ({
-          id: 'pay_http',
-          order_id: 'order_http',
-          status: 'captured',
-          amount: 50000,
-          currency: 'INR',
-        }),
-      })
-      .compile();
-    app = module.createNestApplication<NestExpressApplication>({
-      rawBody: true,
-    });
+    vi.stubEnv('APP_ORIGIN', origin);
+    vi.stubEnv('PAYMENT_UPI_ID', 'organizer@bank');
+    vi.stubEnv('PAYMENT_PAYEE_NAME', 'Organizer');
+    vi.stubEnv('ADMIN_EMAIL', 'admin@example.com');
+    vi.stubEnv(
+      'ADMIN_PASSWORD_HASH',
+      'salt:' + scryptSync('test-password', 'salt', 64).toString('hex'),
+    );
+    const module = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+    app = module.createNestApplication<NestExpressApplication>();
     configure(app);
     await app.init();
     store = app.get(AppService);
@@ -47,8 +34,8 @@ describe('payment HTTP boundary', () => {
     await app.close();
     vi.unstubAllEnvs();
   });
-  it('accepts a signed server webhook without Origin, issues one ticket, and rejects body tampering', async () => {
-    const event = store.create({
+  it('protects approval and rejection from guests and cross-origin requests; only admin approval issues a ticket', async () => {
+    const e = store.create({
       name: 'Concert',
       location: 'Hall',
       startsAt: new Date(Date.now() + 86400000).toISOString(),
@@ -56,9 +43,9 @@ describe('payment HTTP boundary', () => {
       amount: 50000,
     });
     const token = randomBytes(32).toString('hex');
-    await request(app.getHttpServer())
-      .post('/api/events/' + event.id + '/orders')
-      .set('Origin', 'http://localhost:3000')
+    const created = await request(app.getHttpServer())
+      .post('/api/events/' + e.id + '/orders')
+      .set('Origin', origin)
       .send({
         token,
         name: 'Guest',
@@ -66,44 +53,79 @@ describe('payment HTTP boundary', () => {
         phone: '9876543210',
       })
       .expect(201);
-    const raw =
-      '{ "event": "payment.captured", "payload": { "payment": { "entity": { "id":"pay_http", "order_id":"order_http" } } } }';
-    const signature = createHmac('sha256', 'webhook-secret')
-      .update(raw)
-      .digest('hex');
-    for (let i = 0; i < 2; i++)
-      await request(app.getHttpServer())
-        .post('/api/payments/razorpay/webhook')
-        .type('json')
-        .set('x-razorpay-signature', signature)
-        .send(raw)
-        .expect(200);
+    const id = created.body.id;
     await request(app.getHttpServer())
-      .post('/api/payments/razorpay/webhook')
-      .type('json')
-      .set('x-razorpay-signature', signature)
-      .send(raw + ' ')
-      .expect(401);
-    expect(store.event(event.id).registered).toBe(1);
-    const response = await request(app.getHttpServer())
+      .post('/api/payments/submit')
+      .set('Origin', origin)
+      .send({ token, reference: '123456789012' })
+      .expect(200);
+    const body = {
+      reference: '123456789012',
+      amount: 50000,
+      receivedInBank: true,
+      note: 'Checked bank statement and payer',
+    };
+    for (const action of ['approve', 'reject']) {
+      await request(app.getHttpServer())
+        .post('/api/payments/' + id + '/' + action)
+        .set('Origin', origin)
+        .send(body)
+        .expect(401);
+      await request(app.getHttpServer())
+        .post('/api/payments/' + id + '/' + action)
+        .send(body)
+        .expect(403);
+    }
+    expect(store.event(e.id).registered).toBe(0);
+    const admin = request.agent(app.getHttpServer());
+    await admin
+      .post('/api/auth/login')
+      .set('Origin', origin)
+      .send({ email: 'admin@example.com', password: 'test-password' })
+      .expect(201);
+    await admin
+      .post('/api/payments/' + id + '/approve')
+      .set('Origin', 'https://attacker.example')
+      .send(body)
+      .expect(403);
+    const approved = await admin
+      .post('/api/payments/' + id + '/approve')
+      .set('Origin', origin)
+      .send(body)
+      .expect(200);
+    expect(approved.body.status).toBe('PAID');
+    expect(approved.body.ticket.qr).toHaveLength(64);
+    await admin
+      .post('/api/payments/' + id + '/approve')
+      .set('Origin', origin)
+      .send(body)
+      .expect(200);
+    expect(await store.outbox.list()).toHaveLength(1);
+    const status = await request(app.getHttpServer())
       .post('/api/payments/status')
-      .set('Origin', 'http://localhost:3000')
+      .set('Origin', origin)
       .send({ token })
       .expect(200);
-    expect(response.body.status).toBe('PAID');
-    expect(response.body.ticket.qr).toHaveLength(64);
-    expect(response.body.accessHash).toBeUndefined();
+    expect(status.body.accessHash).toBeUndefined();
+    expect(status.body.decision).toBeUndefined();
+    expect(store.event(e.id).registered).toBe(1);
   });
-  it('keeps browser origin checks and admin-only actions protected', async () => {
-    await request(app.getHttpServer())
-      .post('/api/payments/status')
-      .send({ token: 'a'.repeat(64) })
-      .expect(403);
+  it('protects review, check-in and removed provider endpoints', async () => {
     await request(app.getHttpServer()).get('/api/payments/review').expect(401);
     await request(app.getHttpServer())
       .post('/api/tickets/check-in')
-      .set('Origin', 'http://localhost:3000')
+      .set('Origin', origin)
       .send({ ticket: 'a'.repeat(64) })
       .expect(401);
+    await request(app.getHttpServer())
+      .post('/api/payments/verify')
+      .set('Origin', origin)
+      .send({})
+      .expect(404);
+    await request(app.getHttpServer())
+      .post('/api/payments/razorpay/webhook')
+      .set('Origin', origin)
+      .send({})
+      .expect(404);
   });
 });

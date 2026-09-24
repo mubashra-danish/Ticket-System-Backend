@@ -1,259 +1,214 @@
-import { randomBytes, createHmac } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { AppService } from './app.service.js';
 import { PaymentsService } from './payments.service.js';
-import { RazorpayService } from './razorpay.service.js';
-import type { Payment } from './bookings.js';
-describe('verified ticket payments', () => {
-  let store: AppService, payments: PaymentsService, gateway: RazorpayService;
-  let provider: Map<string, Payment>;
-  let sequence: number;
-  let createSpy: import('vitest').MockInstance<RazorpayService['create']>;
+
+describe('manual UPI payment approval', () => {
+  let store: AppService, payments: PaymentsService;
   const guest = {
     name: 'Guest',
     email: 'guest@example.com',
-    phone: '+91 9876543210',
+    phone: '9876543210',
   };
-  const token = () => randomBytes(32).toString('hex');
+  const ref = '123456789012';
+  const decision = (reference = ref) => ({
+    reference,
+    amount: 50000,
+    receivedInBank: true,
+    note: 'Matched Guest and payment date in receiving bank statement',
+  });
   beforeEach(() => {
     vi.stubEnv('DATABASE_PATH', ':memory:');
-    vi.stubEnv('RAZORPAY_KEY_ID', 'rzp_test_example');
-    vi.stubEnv('RAZORPAY_KEY_SECRET', 'test-secret');
-    vi.stubEnv('RAZORPAY_WEBHOOK_SECRET', 'webhook-secret');
+    vi.stubEnv('PAYMENT_UPI_ID', 'organizer@bank');
+    vi.stubEnv('PAYMENT_PAYEE_NAME', 'Organizer');
     store = new AppService();
-    gateway = new RazorpayService();
-    payments = new PaymentsService(store, gateway);
-    provider = new Map();
-    sequence = 0;
-    createSpy = vi.spyOn(gateway, 'create').mockImplementation(async (b) => ({
-      id: 'order_' + ++sequence,
-      amount: b.amount,
-      currency: b.currency,
-      receipt: b.id,
-    }));
-    vi.spyOn(gateway, 'payment').mockImplementation(async (id) => {
-      const p = provider.get(id);
-      if (!p) throw new Error('No payment');
-      return p;
-    });
-    vi.spyOn(gateway, 'orderPayments').mockImplementation(async (id) => ({
-      items: [...provider.values()].filter((p) => p.order_id === id),
-    }));
+    payments = new PaymentsService(store);
   });
   afterEach(() => {
-    payments.onModuleDestroy();
     store.onModuleDestroy();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
   });
-  const event = (capacity = 1) =>
+  const event = (capacity = 2) =>
     store.create({
-      name: 'Paid event',
-      location: 'Studio',
+      name: 'Concert',
+      location: 'Hall',
       startsAt: new Date(Date.now() + 86400000).toISOString(),
       capacity,
       amount: 50000,
     });
-  async function booking(eventId: string, overrides = {}) {
-    const access = token();
-    return {
-      access,
-      b: await payments.create(eventId, {
-        ...guest,
-        token: access,
-        ...overrides,
-      }),
-    };
-  }
-  function capture(orderId: string, id = 'pay_1', overrides = {}) {
-    const p: Payment = {
-      id,
-      order_id: orderId,
-      amount: 50000,
-      currency: 'INR',
-      status: 'captured',
-      ...overrides,
-    };
-    provider.set(id, p);
-    return p;
-  }
-  function signed(b: { orderId: string | null }, access: string, id = 'pay_1') {
-    return {
-      token: access,
-      razorpay_payment_id: id,
-      razorpay_order_id: b.orderId,
-      razorpay_signature: createHmac('sha256', 'test-secret')
-        .update(b.orderId + '|' + id)
-        .digest('hex'),
-    };
-  }
-  function webhook(p: Payment) {
-    const raw = Buffer.from(
-      JSON.stringify({
-        event: 'payment.captured',
-        payload: { payment: { entity: p } },
-      }),
-    );
-    return payments.webhook(
-      raw,
-      createHmac('sha256', 'webhook-secret').update(raw).digest('hex'),
-    );
-  }
-  it('uses server prices and reuses a booking without creating another provider order', async () => {
-    const e = event();
-    const access = token();
-    const b = await payments.create(e.id, {
+  async function booking(id: string, address = guest.email) {
+    const token = randomBytes(32).toString('hex');
+    const b = await payments.create(id, {
       ...guest,
-      token: access,
+      email: address,
+      token,
       amount: 1,
     });
+    return { b, token };
+  }
+  async function submitted(id: string, address = guest.email, reference = ref) {
+    const result = await booking(id, address);
+    await payments.submit({ token: result.token, reference });
+    return result;
+  }
+  it('requires real payment instructions and refuses free-endpoint bypass', async () => {
+    const e = event();
+    expect(() => store.register(e.id, guest)).toThrow();
+    vi.stubEnv('PAYMENT_UPI_ID', '');
+    await expect(booking(e.id)).rejects.toThrow('not available');
+    expect(() => event()).toThrow('PAYMENT_UPI_ID');
+  });
+  it('uses server price, snapshots recipient and does not issue tickets or email on a claim', async () => {
+    const e = event();
+    const { b, token } = await booking(e.id);
     expect(b.amount).toBe(50000);
+    vi.stubEnv('PAYMENT_UPI_ID', 'changed@bank');
+    const pending = await payments.submit({
+      token,
+      reference: ref,
+      status: 'PAID',
+    });
+    expect(pending.status).toBe('AWAITING_APPROVAL');
+    expect(pending.ticket).toBeNull();
+    expect(pending.paymentInstructions?.upiId).toBe('organizer@bank');
     expect(store.event(e.id).registered).toBe(0);
-    await payments.create(e.id, { ...guest, token: access });
-    expect(createSpy).toHaveBeenCalledTimes(1);
-    await expect(payments.status({ token: token() })).rejects.toThrow(
-      'not found',
-    );
-  });
-  it('reserves the final seat and prevents concurrent overselling', async () => {
-    const e = event();
-    const results = await Promise.allSettled([
-      booking(e.id),
-      booking(e.id, { email: 'other@example.com' }),
-    ]);
-    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
-  });
-  it('requires capture and a valid signature before issuing a ticket', async () => {
-    const { access, b } = await booking(event().id);
-    capture(b.orderId!, 'pay_1', { status: 'authorized' });
-    await expect(
-      payments.verify({
-        ...signed(b, access),
-        razorpay_signature: '0'.repeat(64),
-      }),
-    ).rejects.toThrow('signature');
-    expect((await payments.verify(signed(b, access))).ticket).toBeNull();
     expect(await store.outbox.list()).toHaveLength(0);
-    capture(b.orderId!);
-    const paid = await payments.verify(signed(b, access));
-    expect(paid.status).toBe('PAID');
-    expect(paid.ticket?.qr).toHaveLength(64);
-    await payments.verify(signed(b, access));
-    const jobs = await store.outbox.list();
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].payload.ticketToken).toBe(paid.ticket?.qr);
-  });
-  it.each([{ amount: 1 }, { currency: 'USD' }, { order_id: 'order_wrong' }])(
-    'rejects mismatched payment %j',
-    async (mismatch) => {
-      const { access, b } = await booking(event().id);
-      capture(b.orderId!, 'pay_1', mismatch);
-      await expect(payments.verify(signed(b, access))).rejects.toThrow('match');
-    },
-  );
-  it('deduplicates webhook deliveries and callback races', async () => {
-    const e = event();
-    const { access, b } = await booking(e.id);
-    const p = capture(b.orderId!);
-    await Promise.all([
-      webhook(p),
-      webhook(p),
-      payments.verify(signed(b, access)),
-    ]);
-    expect(store.event(e.id).registered).toBe(1);
-    const first = await payments.status({ token: access });
-    await webhook(p);
-    expect((await payments.status({ token: access })).ticket).toEqual(
-      first.ticket,
-    );
-  });
-  it('rejects forged webhooks', async () => {
-    await expect(
-      payments.webhook(Buffer.from('{}'), 'a'.repeat(64)),
-    ).rejects.toThrow('signature');
-  });
-  it('releases expired holds and puts late captures into the refund review queue when full', async () => {
-    const e = event();
-    const first = await booking(e.id);
-    const clock = vi
-      .spyOn(Date, 'now')
-      .mockReturnValue(Date.now() + 16 * 60 * 1000);
-    expect((await payments.status({ token: first.access })).status).toBe(
-      'EXPIRED',
-    );
-    const second = await booking(e.id, { email: 'other@example.com' });
-    capture(second.b.orderId!, 'pay_2');
-    await payments.verify(signed(second.b, second.access, 'pay_2'));
-    await webhook(capture(first.b.orderId!));
-    expect((await payments.status({ token: first.access })).status).toBe(
-      'PAYMENT_REVIEW',
-    );
     expect(await payments.review()).toHaveLength(1);
+    expect((await payments.submit({ token, reference: ref })).status).toBe(
+      'AWAITING_APPROVAL',
+    );
+    await expect(
+      payments.submit({ token, reference: '222222222222' }),
+    ).rejects.toThrow('already been submitted');
+  });
+  it('validates references and private booking access', async () => {
+    const { token } = await booking(event().id);
+    await expect(
+      payments.submit({ token, reference: 'screenshot' }),
+    ).rejects.toThrow('12-digit');
+    await expect(
+      payments.status({ token: randomBytes(32).toString('hex') }),
+    ).rejects.toThrow('not found');
+  });
+  it('requires a submitted claim and exact verified bank details', async () => {
+    const { b, token } = await booking(event().id);
+    await expect(payments.approve(b.id, decision(), 'admin')).rejects.toThrow();
+    await payments.submit({ token, reference: ref });
+    for (const patch of [
+      { receivedInBank: false },
+      { amount: 1 },
+      { reference: '222222222222' },
+      { note: '' },
+    ])
+      await expect(
+        payments.approve(b.id, { ...decision(), ...patch }, 'admin'),
+      ).rejects.toThrow();
+    expect(await store.outbox.list()).toHaveLength(0);
+  });
+  it('atomically approves once, records the admin, queues one email and allows one check-in', async () => {
+    const e = event();
+    const { b, token } = await submitted(e.id);
+    const [one, two] = await Promise.all([
+      payments.approve(b.id, decision(), 'admin@example.com'),
+      payments.approve(b.id, decision(), 'admin@example.com'),
+    ]);
+    expect(one.status).toBe('PAID');
+    expect(two.ticket).toEqual(one.ticket);
+    expect(store.event(e.id).registered).toBe(1);
+    expect(await store.outbox.list()).toHaveLength(1);
+    expect((await store.bookings.get(b.id))?.decision?.actor).toBe(
+      'admin@example.com',
+    );
+    expect((await payments.status({ token })).ticket?.qr).toHaveLength(64);
+    await payments.checkin({ ticket: one.ticket?.qr });
+    await expect(payments.checkin({ ticket: one.ticket?.qr })).rejects.toThrow(
+      'already been checked in',
+    );
+    await expect(
+      payments.reject(b.id, { reason: 'No' }, 'admin'),
+    ).rejects.toThrow();
+  });
+  it('prevents a verified reference being reused across events and rolls back the second approval', async () => {
+    const a = await submitted(event().id);
+    const b = await submitted(event().id, 'other@example.com');
+    await payments.approve(a.b.id, decision(), 'admin');
+    await expect(payments.approve(b.b.id, decision(), 'admin')).rejects.toThrow(
+      'already been used',
+    );
+    expect((await payments.status({ token: b.token })).status).toBe(
+      'AWAITING_APPROVAL',
+    );
+    expect(await store.outbox.list()).toHaveLength(1);
+  });
+  it('does not let an unverified claim block the legitimate use of a reference', async () => {
+    await submitted(event().id, 'claim@example.com');
+    const valid = await submitted(event().id, 'real@example.com');
+    expect(
+      (await payments.approve(valid.b.id, decision(), 'admin')).status,
+    ).toBe('PAID');
+  });
+  it('rejects without issuing an email, releases the seat and prevents later approval', async () => {
+    const e = event(1);
+    const { b, token } = await submitted(e.id);
+    const rejected = await payments.reject(
+      b.id,
+      { reason: 'No matching credit. Contact us with the correct reference.' },
+      'admin',
+    );
+    expect(rejected.status).toBe('REJECTED');
+    expect(rejected.ticket).toBeNull();
+    expect((await payments.status({ token })).message).toContain(
+      'No matching credit',
+    );
+    await expect(payments.approve(b.id, decision(), 'admin')).rejects.toThrow();
+    await expect(payments.submit({ token, reference: ref })).rejects.toThrow();
+    expect(await store.outbox.list()).toHaveLength(0);
+    await booking(e.id);
+  });
+  it('holds seats for pending approval and prevents duplicate bookings', async () => {
+    const e = event(1);
+    await submitted(e.id);
+    await expect(booking(e.id, 'other@example.com')).rejects.toThrow(
+      'reserved',
+    );
+    await expect(booking(e.id)).rejects.toThrow('already');
+  });
+  it('does not oversell when an expired payment is approved after another booking took the seat', async () => {
+    const e = event(1);
+    const old = await submitted(e.id);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 31 * 60000);
+    const next = await submitted(e.id, 'other@example.com', '222222222222');
+    const late = await payments.approve(old.b.id, decision(), 'admin');
+    expect(late.status).toBe('PAYMENT_REVIEW');
+    expect(late.ticket).toBeNull();
+    expect(late.message).toContain('refund');
+    expect(
+      (await payments.approve(next.b.id, decision('222222222222'), 'admin'))
+        .status,
+    ).toBe('PAID');
     expect(store.event(e.id).registered).toBe(1);
     clock.mockRestore();
   });
-  it('recovers a missed webhook by reconciliation, even after hold expiry when a seat is free', async () => {
-    const e = event();
-    const { access, b } = await booking(e.id);
-    capture(b.orderId!);
-    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 16 * 60 * 1000);
-    await payments.reconcile();
-    expect((await payments.status({ token: access })).status).toBe('PAID');
-  });
-  it('does not blindly retry provider order creation after an ambiguous timeout', async () => {
-    createSpy.mockRejectedValueOnce(new Error('timeout'));
-    const e = event();
-    const access = token();
-    await expect(
-      payments.create(e.id, { ...guest, token: access }),
-    ).rejects.toThrow('timeout');
-    const result = await payments.create(e.id, { ...guest, token: access });
-    expect(result.orderId).toBeNull();
-    expect(createSpy).toHaveBeenCalledTimes(1);
-  });
-  it('accepts a ticket exactly once at check-in', async () => {
-    const { access, b } = await booking(event().id);
-    capture(b.orderId!);
-    const result = await payments.verify(signed(b, access));
-    await payments.checkin({ ticket: result.ticket!.qr });
-    await expect(
-      payments.checkin({ ticket: result.ticket!.qr }),
-    ).rejects.toThrow('already');
-  });
-  it('keeps failed and refunded payments from issuing tickets', async () => {
-    const { access, b } = await booking(event().id);
-    capture(b.orderId!, 'pay_1', { status: 'failed' });
-    await payments.reconcile();
-    expect((await payments.status({ token: access })).ticket).toBeNull();
-    capture(b.orderId!, 'pay_1', { amount_refunded: 50000 });
-    expect((await payments.verify(signed(b, access))).ticket).toBeNull();
-  });
-  it('revokes fully refunded tickets and prevents replay from resurrecting them', async () => {
-    const e = event();
-    const { access, b } = await booking(e.id);
-    capture(b.orderId!);
-    const paid = await payments.verify(signed(b, access));
-    const p = capture(b.orderId!, 'pay_1', {
-      status: 'refunded',
-      amount_refunded: 50000,
-    });
-    const raw = Buffer.from(
-      JSON.stringify({
-        event: 'refund.processed',
-        payload: { payment: { entity: p } },
-      }),
+  it('allows reporting a late transfer and approving it if a seat is available', async () => {
+    const { b, token } = await booking(event().id);
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 31 * 60000);
+    expect((await payments.status({ token })).status).toBe('EXPIRED');
+    await payments.submit({ token, reference: ref });
+    expect((await payments.approve(b.id, decision(), 'admin')).status).toBe(
+      'PAID',
     );
-    const signature = createHmac('sha256', 'webhook-secret')
-      .update(raw)
-      .digest('hex');
-    await payments.webhook(raw, signature);
-    await payments.webhook(raw, signature);
-    expect((await payments.status({ token: access })).status).toBe('REFUNDED');
+  });
+  it('rolls back the approval if email queue persistence fails', async () => {
+    const e = event();
+    const { b, token } = await submitted(e.id);
+    vi.spyOn(store.outbox, 'enqueue').mockImplementation(() => {
+      throw new Error('disk failure');
+    });
+    await expect(payments.approve(b.id, decision(), 'admin')).rejects.toThrow(
+      'disk failure',
+    );
     expect(store.event(e.id).registered).toBe(0);
-    await expect(
-      payments.checkin({ ticket: paid.ticket!.qr }),
-    ).rejects.toThrow();
-    capture(b.orderId!);
-    await webhook(provider.get('pay_1')!);
-    expect((await payments.status({ token: access })).ticket).toBeNull();
+    expect((await payments.status({ token })).status).toBe('AWAITING_APPROVAL');
   });
 });

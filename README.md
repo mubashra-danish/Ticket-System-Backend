@@ -31,7 +31,7 @@ npm.cmd run lint
 Writes require application/json and an Origin exactly matching APP_ORIGIN. Browser requests go through the frontend's same-origin proxy. No permissive CORS is enabled.
 
 ## Security and deployment
-Sessions are random opaque tokens, hashed in the database, expire after eight hours, and are revoked on logout. Cookies are HttpOnly, SameSite=Strict, and Secure in production. Passwords use scrypt. SQL uses bound parameters; registration capacity and uniqueness are checked inside a write transaction. The API validates input and requires Razorpay configuration for paid events.
+Sessions are random opaque tokens, hashed in the database, expire after eight hours, and are revoked on logout. Cookies are HttpOnly, SameSite=Strict, and Secure in production. Passwords use scrypt. SQL uses bound parameters; registration capacity and uniqueness are checked inside a write transaction. The API validates input and requires a configured receiving UPI account for paid events.
 
 For production set NODE_ENV=production, APP_ORIGIN=https://your-domain.example, a private DATABASE_PATH on a persistent disk, and the admin environment values. Build then run npm run start:prod. Terminate TLS at your trusted proxy and keep the API private. The default HOST is loopback; containers may need HOST=0.0.0.0 on a private network.
 
@@ -53,8 +53,8 @@ Run `npm.cmd run setup` after saving the file. It preserves existing MongoDB and
 
 For MongoDB deployments, back up the MongoDB database instead of the SQLite file. Existing SQLite records are not migrated automatically. Configure database user permissions and Atlas network access for the API host. Connection errors are deliberately generic to avoid leaking URI credentials. MongoDB session and rate-limit collections have TTL indexes; session expiry is also checked on every authenticated request. The rate limiter uses fixed windows and counts atomically in MongoDB.
 
-## Razorpay
-Paid checkout, signed webhooks, ticket issuance, reconciliation and admin check-in are implemented. Read [PAYMENTS.md](PAYMENTS.md) for required keys, webhook setup, test-mode verification, refund behavior and known launch constraints.
+## Direct UPI payments
+Direct UPI payments, admin verification, ticket issuance and single-use admin check-in are implemented. Read [PAYMENTS.md](PAYMENTS.md) for receiving-account setup, verification, refund handling and limitations. Razorpay integration has been removed.
 
 ## Ticket email
 
