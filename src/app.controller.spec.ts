@@ -16,6 +16,7 @@ describe('registration rules', () => {
     name: 'Guest',
     email: 'guest@example.com',
     phone: '+91 9876543210',
+    aadhaar: '123456789012',
   };
   it('prevents duplicate registrations and overselling', () => {
     const created = service.create(event());

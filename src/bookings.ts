@@ -9,6 +9,7 @@ export type Booking = {
   name: string;
   email: string;
   phone: string;
+  aadhaar?: string;
   amount: number;
   currency: 'INR';
   status:
@@ -57,7 +58,8 @@ export function reservation(
       existing.eventId !== input.eventId ||
       existing.email !== input.email ||
       existing.name !== input.name ||
-      existing.phone !== input.phone
+      existing.phone !== input.phone ||
+      existing.aadhaar !== input.aadhaar
     )
       throw new ConflictException(
         'This checkout belongs to another registration. Start a new booking.',

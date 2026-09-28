@@ -141,6 +141,7 @@ export class MongoBookings implements BookingStore {
             name: b.name,
             email: b.email,
             phone: b.phone,
+            aadhaar: b.aadhaar ?? null,
             createdAt: new Date().toISOString(),
           },
           { session },

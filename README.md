@@ -25,10 +25,15 @@ npm.cmd run lint
 - POST /api/auth/login (email, password), GET /api/auth/me, POST /api/auth/logout
 - GET /api/events, GET /api/events/:id
 - POST /api/events (admin): name, startsAt (ISO timestamp), location, capacity, amount (integer paise; zero for free events)
-- POST /api/events/:id/registrations: name, email, phone
+- POST /api/events/:id/registrations: name, email, phone, aadhaar, verificationToken
+- POST /api/email-verification/send: email, eventId; POST /api/email-verification/verify: email, eventId, challengeId, otp
 - GET /api/registrations (admin, most recent 1,000)
 
 Writes require application/json and an Origin exactly matching APP_ORIGIN. Browser requests go through the frontend's same-origin proxy. No permissive CORS is enabled.
+
+Free registration and paid order creation also require an email/event-bound `verificationToken` from the verification endpoint. Configure SMTP before accepting registrations; see [EMAIL.md](EMAIL.md). Pending verification state is in memory, so use a single API instance and request a new code after a restart.
+
+New free registrations and paid orders require `aadhaar` as a string of exactly 12 digits. This is a format check, not Aadhaar identity verification. SQLite and MongoDB store it with the attendee; paid bookings copy it into the registration when approved. The protected admin attendee list displays it. Confirmation emails, ticket QR codes and guest booking responses do not include it. SQLite adds the column automatically on startup; older registrations have no value and display "Not provided".
 
 ## Security and deployment
 Sessions are random opaque tokens, hashed in the database, expire after eight hours, and are revoked on logout. Cookies are HttpOnly, SameSite=Strict, and Secure in production. Passwords use scrypt. SQL uses bound parameters; registration capacity and uniqueness are checked inside a write transaction. The API validates input and requires a configured receiving UPI account for paid events.
@@ -58,4 +63,4 @@ Direct UPI payments, admin verification, ticket issuance and single-use admin ch
 
 ## Ticket email
 
-Automatic confirmations and paid-ticket QR emails are implemented with a durable Resend queue. See [EMAIL.md](EMAIL.md) to configure a verified sender. GET /api/emails/status is admin-only.
+Automatic confirmations and paid-ticket QR emails are implemented with a durable SMTP queue. See [EMAIL.md](EMAIL.md) to configure a verified sender. GET /api/emails/status is admin-only.

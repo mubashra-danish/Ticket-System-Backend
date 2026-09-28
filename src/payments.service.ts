@@ -7,7 +7,13 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { randomBytes } from 'node:crypto';
-import { AppService, digest, email, field } from './app.service.js';
+import {
+  AppService,
+  digest,
+  email,
+  field,
+  aadhaarNumber,
+} from './app.service.js';
 import type { MongoService } from './mongo.service.js';
 import type { Booking } from './bookings.js';
 import { emailConfigured } from './email.service.js';
@@ -69,6 +75,7 @@ export class PaymentsService {
       event = await this.store.event(eventId);
     const name = field(body, 'name', 120),
       address = email(body),
+      aadhaar = aadhaarNumber(body),
       phone = field(body, 'phone', 24);
     if (!/^[+\d ()-]{7,24}$/.test(phone))
       throw new BadRequestException('Invalid phone number');
@@ -81,6 +88,7 @@ export class PaymentsService {
       name,
       email: address,
       phone,
+      aadhaar,
       amount: event.amount,
       currency: 'INR',
       status: 'PENDING',

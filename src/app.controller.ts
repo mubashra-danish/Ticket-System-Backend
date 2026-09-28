@@ -13,6 +13,7 @@ import type { Request, Response } from 'express';
 import { AppService } from './app.service.js';
 import type { MongoService } from './mongo.service.js';
 import { emailConfigured } from './email.service.js';
+import { EmailVerificationService } from './email-verification.service.js';
 export function sessionToken(req: Request) {
   return (
     (req.headers.cookie || '')
@@ -32,6 +33,8 @@ const cookieOptions = () => ({
 export class AppController {
   constructor(
     @Inject(AppService) private readonly service: AppService | MongoService,
+    @Inject(EmailVerificationService)
+    private readonly verification: EmailVerificationService,
   ) {}
   private async admin(req: Request) {
     if (!(await this.service.authenticated(sessionToken(req))))
@@ -80,6 +83,7 @@ export class AppController {
     @Param('id') id: string,
     @Body() body: Record<string, unknown>,
   ) {
+    this.verification.assertVerified(id, body);
     return {
       ...(await this.service.register(id, body)),
       emailStatus: emailConfigured() ? 'PENDING' : 'NOT_CONFIGURED',

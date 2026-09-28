@@ -6,11 +6,22 @@ import { randomBytes, scryptSync } from 'node:crypto';
 import { AppModule } from '../src/app.module.js';
 import { AppService } from '../src/app.service.js';
 import { configure } from '../src/configure.js';
+import { EmailTransport } from '../src/email.service.js';
+import { TestEmailTransport, verifiedGuest } from './verification-helper.js';
 
 describe('manual payment HTTP boundary', () => {
   let app: NestExpressApplication, store: AppService;
+  let transport: TestEmailTransport;
   const origin = 'http://localhost:3000';
   beforeEach(async () => {
+    vi.stubEnv('EMAIL_ENABLED', 'true');
+    vi.stubEnv('SMTP_HOST', 'smtp.example.com');
+    vi.stubEnv('SMTP_PORT', '587');
+    vi.stubEnv('SMTP_SECURE', 'false');
+    vi.stubEnv('SMTP_USER', 'test-only');
+    vi.stubEnv('SMTP_PASS', 'test-only');
+    vi.stubEnv('EMAIL_FROM', 'test@example.com');
+    transport = new TestEmailTransport();
     for (const key of ['MONGODB_URI', 'MONGO_URL', 'MONGO_URI'])
       vi.stubEnv(key, '');
     vi.stubEnv('DATABASE_PATH', ':memory:');
@@ -24,7 +35,10 @@ describe('manual payment HTTP boundary', () => {
     );
     const module = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(EmailTransport)
+      .useValue(transport)
+      .compile();
     app = module.createNestApplication<NestExpressApplication>();
     configure(app);
     await app.init();
@@ -43,14 +57,22 @@ describe('manual payment HTTP boundary', () => {
       amount: 50000,
     });
     const token = randomBytes(32).toString('hex');
+    const verificationToken = await verifiedGuest(
+      app,
+      transport,
+      e.id,
+      'guest@example.com',
+    );
     const created = await request(app.getHttpServer())
       .post('/api/events/' + e.id + '/orders')
       .set('Origin', origin)
       .send({
+        verificationToken,
         token,
         name: 'Guest',
         email: 'guest@example.com',
         phone: '9876543210',
+        aadhaar: '123456789012',
       })
       .expect(201);
     const id = created.body.id;
@@ -109,6 +131,8 @@ describe('manual payment HTTP boundary', () => {
     expect(status.body.accessHash).toBeUndefined();
     expect(status.body.decision).toBeUndefined();
     expect(store.event(e.id).registered).toBe(1);
+    expect(store.registrations()[0]).toMatchObject({ aadhaar: '123456789012' });
+    expect(status.body.aadhaar).toBeUndefined();
   });
   it('protects review, check-in and removed provider endpoints', async () => {
     await request(app.getHttpServer()).get('/api/payments/review').expect(401);

@@ -65,6 +65,7 @@ export class MongoEmailOutbox implements EmailOutbox {
         leaseUntil: 0,
         leaseToken: null,
         request: null,
+        smtpStartedAt: null,
       },
     });
   }
@@ -72,6 +73,7 @@ export class MongoEmailOutbox implements EmailOutbox {
     await this.rows.updateOne(this.owned(job), {
       $set: {
         status: terminal ? 'FAILED' : 'PENDING',
+        smtpStartedAt: null,
         lastError: error,
         nextAttempt: retryAt(job.attempts),
         leaseUntil: 0,
@@ -88,6 +90,20 @@ export class MongoEmailOutbox implements EmailOutbox {
         leaseToken: null,
       },
     });
+  }
+  async beginSend(job: EmailJob) {
+    return (
+      (
+        await this.rows.updateOne(
+          {
+            ...this.owned(job),
+            leaseUntil: { $gt: Date.now() },
+            smtpStartedAt: null,
+          },
+          { $set: { smtpStartedAt: Date.now() } },
+        )
+      ).matchedCount === 1
+    );
   }
   async list() {
     return this.rows

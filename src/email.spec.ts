@@ -14,11 +14,16 @@ describe('durable ticket email delivery', () => {
     name: 'Guest <script>',
     email: 'guest@example.com',
     phone: '+91 9876543210',
+    aadhaar: '123456789012',
   };
   beforeEach(() => {
     vi.stubEnv('DATABASE_PATH', ':memory:');
     vi.stubEnv('EMAIL_ENABLED', 'true');
-    vi.stubEnv('RESEND_API_KEY', 'test-only');
+    vi.stubEnv('SMTP_HOST', 'smtp.example.com');
+    vi.stubEnv('SMTP_PORT', '587');
+    vi.stubEnv('SMTP_SECURE', 'false');
+    vi.stubEnv('SMTP_USER', 'test-only');
+    vi.stubEnv('SMTP_PASS', 'test-only');
     vi.stubEnv('EMAIL_FROM', 'Tickets <tickets@example.com>');
     store = new AppService();
     transport = new EmailTransport();
@@ -68,9 +73,9 @@ describe('durable ticket email delivery', () => {
     expect(send).not.toHaveBeenCalled();
     expect((await store.outbox.list())[0].status).toBe('PENDING');
   });
-  it('retries a transient failure with the identical body and idempotency key', async () => {
+  it('retries a confirmed temporary rejection with the identical body and message identifier', async () => {
     register();
-    send.mockRejectedValueOnce(new EmailSendError('Timeout'));
+    send.mockRejectedValueOnce(new EmailSendError('SMTP 451'));
     await worker.flush();
     const first = send.mock.calls[0];
     const job = (await store.outbox.list())[0];
@@ -92,7 +97,7 @@ describe('durable ticket email delivery', () => {
     await store.outbox.complete(second, 'current');
     expect((await store.outbox.get(first.id))!.providerId).toBe('current');
   });
-  it('stops ambiguous retries before provider deduplication expires', async () => {
+  it('stops retries after the configured retry window', async () => {
     register();
     const claimed = (await store.outbox.claim())!;
     vi.spyOn(Date, 'now').mockReturnValue(
@@ -104,7 +109,7 @@ describe('durable ticket email delivery', () => {
   });
   it('flags permanent failures for admin review', async () => {
     register();
-    send.mockRejectedValue(new EmailSendError('HTTP 403', true));
+    send.mockRejectedValue(new EmailSendError('SMTP 535', true));
     await worker.flush();
     await worker.flush();
     expect(send).toHaveBeenCalledTimes(1);
@@ -124,5 +129,41 @@ describe('durable ticket email delivery', () => {
     store.outbox.enqueue(job);
     await worker.flush();
     expect((await store.outbox.get('paid-test'))!.status).toBe('CANCELLED');
+  });
+  it('does not resend after a worker disappears during an SMTP attempt', async () => {
+    register();
+    const first = (await store.outbox.claim())!;
+    await store.outbox.prepare(first, await emailRequest(first.payload));
+    expect(await store.outbox.beginSend(first)).toBe(true);
+    vi.spyOn(Date, 'now').mockReturnValue(first.leaseUntil + 1);
+    await worker.flush();
+    expect(send).not.toHaveBeenCalled();
+    expect(await store.outbox.get(first.id)).toMatchObject({
+      status: 'FAILED',
+      lastError: expect.stringContaining('unknown'),
+    });
+    expect(await store.outbox.beginSend(first)).toBe(false);
+  });
+  it('does not resend if SMTP accepted the message but database acknowledgement failed', async () => {
+    register();
+    vi.spyOn(store.outbox, 'complete').mockRejectedValue(
+      new Error('database unavailable'),
+    );
+    await worker.flush();
+    await worker.flush();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect((await store.outbox.list())[0].status).toBe('FAILED');
+  });
+  it('stops an uncertain delivery from the previous transport during migration', async () => {
+    register();
+    const first = (await store.outbox.claim())!;
+    const legacy = JSON.parse(await emailRequest(first.payload));
+    delete legacy.transport;
+    await store.outbox.prepare(first, JSON.stringify(legacy));
+    await store.outbox.fail(first, 'Previous provider timeout', false);
+    vi.spyOn(Date, 'now').mockReturnValue(first.leaseUntil + 1);
+    await worker.flush();
+    expect(send).not.toHaveBeenCalled();
+    expect((await store.outbox.list())[0].status).toBe('FAILED');
   });
 });

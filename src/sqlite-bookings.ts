@@ -132,7 +132,9 @@ export class SqliteBookings implements BookingStore {
         b.ticketToken = ticketToken;
         this.outbox.enqueue(emailJob(event, b, ticketToken));
         this.db
-          .prepare('INSERT INTO registrations VALUES (?,?,?,?,?,?)')
+          .prepare(
+            'INSERT INTO registrations (id,eventId,name,email,phone,createdAt,aadhaar) VALUES (?,?,?,?,?,?,?)',
+          )
           .run(
             b.id,
             b.eventId,
@@ -140,6 +142,7 @@ export class SqliteBookings implements BookingStore {
             b.email,
             b.phone,
             new Date().toISOString(),
+            b.aadhaar ?? null,
           );
       } else {
         b.status = 'PAYMENT_REVIEW';

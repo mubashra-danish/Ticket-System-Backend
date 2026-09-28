@@ -6,6 +6,8 @@ import {
   OnModuleDestroy,
 } from '@nestjs/common';
 import QRCode from 'qrcode';
+import { EmailSendError, EmailTransport, smtpSettings } from './smtp.js';
+export { EmailSendError, EmailTransport } from './smtp.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { AppService } from './app.service.js';
 import type { MongoService } from './mongo.service.js';
@@ -15,11 +17,7 @@ import {
   type EmailPayload,
 } from './email-outbox.js';
 export function emailConfigured() {
-  return (
-    process.env.EMAIL_ENABLED === 'true' &&
-    !!process.env.RESEND_API_KEY &&
-    !!process.env.EMAIL_FROM
-  );
+  return process.env.EMAIL_ENABLED === 'true' && !!smtpSettings();
 }
 export const escapeHtml = (value: string) =>
   value.replace(
@@ -80,6 +78,7 @@ export async function emailRequest(p: EmailPayload) {
       ]
     : [];
   return JSON.stringify({
+    transport: 'smtp',
     from: process.env.EMAIL_FROM,
     to: [p.to],
     subject: (title + ' - ' + p.eventName).replace(/[\r\n]/g, ' '),
@@ -87,45 +86,6 @@ export async function emailRequest(p: EmailPayload) {
     text,
     ...(attachments.length ? { attachments } : {}),
   });
-}
-export class EmailSendError extends Error {
-  constructor(
-    message: string,
-    public terminal = false,
-  ) {
-    super(message);
-  }
-}
-@Injectable()
-export class EmailTransport {
-  async send(id: string, request: string) {
-    let response: Response;
-    try {
-      response = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + process.env.RESEND_API_KEY,
-          'Content-Type': 'application/json',
-          'Idempotency-Key': id,
-        },
-        body: request,
-        signal: AbortSignal.timeout(15000),
-      });
-    } catch {
-      throw new EmailSendError('Email provider timeout or network failure');
-    }
-    if (!response.ok)
-      throw new EmailSendError(
-        'Email provider returned HTTP ' + response.status,
-        response.status >= 400 &&
-          response.status < 500 &&
-          ![408, 409, 429].includes(response.status),
-      );
-    const body = (await response.json()) as { id?: unknown };
-    if (typeof body.id !== 'string')
-      throw new EmailSendError('Email provider returned an invalid response');
-    return body.id;
-  }
 }
 @Injectable()
 export class EmailService implements OnModuleInit, OnModuleDestroy {
@@ -166,6 +126,32 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
       const job = await this.store.outbox.claim();
       if (!job) return;
       try {
+        // A prior worker may have sent this message and crashed before acknowledgement.
+        // SMTP cannot deduplicate a resend, including messages attempted before migration.
+        if (
+          job.attempts > 1 &&
+          job.request &&
+          (JSON.parse(job.request) as { transport?: string }).transport !==
+            'smtp'
+        ) {
+          await this.store.outbox.fail(
+            job,
+            'Previously attempted email uses the old transport. Check provider logs before any manual resend.',
+            true,
+          );
+          continue;
+        }
+        if (
+          job.smtpStartedAt != null ||
+          (job.attempts > 1 && job.request && !job.lastError)
+        ) {
+          await this.store.outbox.fail(
+            job,
+            'Previous delivery outcome is unknown. Check provider logs before any manual resend.',
+            true,
+          );
+          continue;
+        }
         if (
           Date.now() - (job.firstAttempt ?? Date.now()) >= RETRY_WINDOW ||
           job.attempts > 12
@@ -190,9 +176,10 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
             continue;
           }
         }
-        // Save the exact request before the first send: retries must match the provider's idempotency payload.
+        // Preserve message content across known-safe retries.
         const request = job.request || (await emailRequest(job.payload));
         if (!(await this.store.outbox.prepare(job, request))) continue;
+        if (!(await this.store.outbox.beginSend(job))) continue;
         const providerId = await this.transport.send(job.id, request);
         await this.store.outbox.complete(job, providerId);
       } catch (error) {
@@ -201,12 +188,12 @@ export class EmailService implements OnModuleInit, OnModuleDestroy {
     }
   }
   private async failed(job: EmailJob, error: unknown) {
-    const terminal = error instanceof EmailSendError && error.terminal;
+    const terminal = !(error instanceof EmailSendError) || error.terminal;
     await this.store.outbox.fail(
       job,
       error instanceof EmailSendError
         ? error.message
-        : 'Email preparation or acknowledgement failed',
+        : 'Email preparation or acknowledgement failed. Check provider logs before any manual resend.',
       terminal,
     );
     this.logger.warn(

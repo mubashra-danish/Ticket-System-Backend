@@ -1,154 +1,164 @@
 import {
   BadRequestException,
-  Injectable,
- HttpException,
+  ForbiddenException,
+  HttpException,
   HttpStatus,
-} from "@nestjs/common";
-import { createHash, randomInt } from "crypto";
+  Inject,
+  Injectable,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { createHash, randomBytes, randomInt } from 'node:crypto';
+import { AppService } from './app.service.js';
+import type { MongoService } from './mongo.service.js';
+import { emailConfigured, EmailTransport } from './email.service.js';
 
-type VerificationRecord = {
-  email: string;
+const TTL = 10 * 60 * 1000;
+const hash = (value: string) =>
+  createHash('sha256').update(value).digest('hex');
+type Challenge = {
+  id: string;
+  eventId: string;
   otpHash: string;
   expiresAt: number;
   attempts: number;
-  lastSentAt: number;
-  verified: boolean;
+  sentAt: number;
+  ready: boolean;
 };
+type Proof = { email: string; eventId: string; expiresAt: number };
 
 @Injectable()
 export class EmailVerificationService {
-  private readonly records = new Map<string, VerificationRecord>();
-
-  private readonly OTP_TTL = 10 * 60 * 1000; // 10 minutes
-  private readonly RESEND_COOLDOWN = 60 * 1000; // 60 seconds
-  private readonly MAX_ATTEMPTS = 5;
-
-  private normalizeEmail(email: string) {
-    return email.trim().toLowerCase();
-  }
-
-  private hashOtp(email: string, otp: string) {
-    return createHash("sha256")
-      .update(`${email}:${otp}`)
-      .digest("hex");
-  }
-
-  async send(email: string) {
-    const normalizedEmail = this.normalizeEmail(email);
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-      throw new BadRequestException("Enter a valid email address.");
-    }
-
-    const existing = this.records.get(normalizedEmail);
-    const now = Date.now();
-
+  private readonly challenges = new Map<string, Challenge>();
+  private readonly proofs = new Map<string, Proof>();
+  constructor(
+    @Inject(EmailTransport) private readonly transport: EmailTransport,
+    @Inject(AppService) private readonly store: AppService | MongoService,
+  ) {}
+  private email(value: unknown) {
     if (
-      existing &&
-      now - existing.lastSentAt < this.RESEND_COOLDOWN
-    ) {
-      const remaining = Math.ceil(
-        (this.RESEND_COOLDOWN -
-          (now - existing.lastSentAt)) /
-          1000,
+      typeof value !== 'string' ||
+      value.length > 254 ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value.trim())
+    )
+      throw new BadRequestException('Enter a valid email address.');
+    return value.trim().toLowerCase();
+  }
+  private cleanup() {
+    const now = Date.now();
+    for (const [key, value] of this.challenges)
+      if (value.expiresAt <= now) this.challenges.delete(key);
+    for (const [key, value] of this.proofs)
+      if (value.expiresAt <= now) this.proofs.delete(key);
+  }
+  async send(body: Record<string, unknown>) {
+    const email = this.email(body.email);
+    if (typeof body.eventId !== 'string' || body.eventId.length > 120)
+      throw new BadRequestException('Event is required.');
+    const event = await this.store.event(body.eventId);
+    if (Date.parse(event.startsAt) <= Date.now())
+      throw new BadRequestException('Registration has closed.');
+    if (!emailConfigured())
+      throw new ServiceUnavailableException(
+        'Email verification is unavailable. Please contact the organizer.',
       );
-
+    this.cleanup();
+    const existing = this.challenges.get(email);
+    if (existing && Date.now() - existing.sentAt < 60000)
       throw new HttpException(
-  `Please wait ${remaining} seconds before requesting another code.`,
-  HttpStatus.TOO_MANY_REQUESTS,
-);
-    }
-
-    const otp = randomInt(100000, 1000000).toString();
-
-    const record: VerificationRecord = {
-      email: normalizedEmail,
-      otpHash: this.hashOtp(normalizedEmail, otp),
-      expiresAt: now + this.OTP_TTL,
+        'Please wait 60 seconds before requesting another code.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    if (this.challenges.size >= 5000 || this.proofs.size >= 5000)
+      throw new ServiceUnavailableException('Please try again later.');
+    if (
+      !(await this.store.limit(
+        'email-verification:' + hash(email),
+        5,
+        60 * 60 * 1000,
+      ))
+    )
+      throw new HttpException(
+        'Too many verification emails. Try again in an hour.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    // Recheck after the asynchronous rate-limit operation to serialize concurrent sends.
+    const current = this.challenges.get(email);
+    if (current && Date.now() - current.sentAt < 60000)
+      throw new HttpException(
+        'Please wait 60 seconds before requesting another code.',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    const code = randomInt(100000, 1000000).toString();
+    const id = randomBytes(32).toString('hex');
+    const challenge: Challenge = {
+      id,
+      eventId: body.eventId,
+      otpHash: hash(id + code),
+      expiresAt: Date.now() + TTL,
       attempts: 0,
-      lastSentAt: now,
-      verified: false,
+      sentAt: Date.now(),
+      ready: false,
     };
-
-    this.records.set(normalizedEmail, record);
-
-    // Temporary development version.
-    // Replace this with your existing EmailService below.
-    console.log(
-      `[EmailVerification] OTP for ${normalizedEmail}: ${otp}`,
-    );
-
-    return {
-      message: "Verification code sent.",
-      expiresIn: this.OTP_TTL / 1000,
-    };
+    this.challenges.set(email, challenge);
+    try {
+      await this.transport.send(
+        'verification-' + id,
+        JSON.stringify({
+          from: process.env.EMAIL_FROM,
+          to: [email],
+          subject: 'Your Ticket System verification code',
+          text: `Your verification code is ${code}. It expires in 10 minutes. Do not share this code. If you did not request it, ignore this email.`,
+        }),
+      );
+      challenge.ready = true;
+    } catch {
+      // Keep the cooldown even when delivery fails; never claim that a code was sent.
+      throw new ServiceUnavailableException(
+        'Could not send your verification email. Please try again in 60 seconds.',
+      );
+    }
+    return { challengeId: id, expiresIn: TTL / 1000, resendAfter: 60 };
   }
-
-  verify(email: string, otp: string) {
-    const normalizedEmail = this.normalizeEmail(email);
-    const record = this.records.get(normalizedEmail);
-
-    if (!record) {
-      throw new BadRequestException(
-        "No verification code was requested for this email.",
+  verify(body: Record<string, unknown>) {
+    const email = this.email(body.email);
+    this.cleanup();
+    const record = this.challenges.get(email);
+    if (
+      !record ||
+      !record.ready ||
+      record.id !== body.challengeId ||
+      record.eventId !== body.eventId
+    )
+      throw new BadRequestException('Request a new verification code.');
+    if (record.attempts >= 5)
+      throw new HttpException(
+        'Too many incorrect attempts. Request a new code.',
+        HttpStatus.TOO_MANY_REQUESTS,
       );
-    }
-
-    if (record.verified) {
-      return {
-        verified: true,
-        message: "Email is already verified.",
-      };
-    }
-
-    if (Date.now() > record.expiresAt) {
-      this.records.delete(normalizedEmail);
-
-      throw new BadRequestException(
-        "This verification code has expired. Please request a new code.",
-      );
-    }
-
-    if (!/^\d{6}$/.test(otp)) {
-      throw new BadRequestException(
-        "Enter the 6-digit verification code.",
-      );
-    }
-
-    if (record.attempts >= this.MAX_ATTEMPTS) {
-      this.records.delete(normalizedEmail);
-
-     throw new HttpException(
-  "Too many incorrect attempts. Please request a new code.",
-  HttpStatus.TOO_MANY_REQUESTS,
-);
-    }
     record.attempts++;
-
-    const suppliedHash = this.hashOtp(
-      normalizedEmail,
-      otp,
-    );
-
-    if (suppliedHash !== record.otpHash) {
-      throw new BadRequestException(
-        `Incorrect verification code. ${
-          this.MAX_ATTEMPTS - record.attempts
-        } attempts remaining.`,
-      );
-    }
-
-    record.verified = true;
-
-    return {
-      verified: true,
-      email: normalizedEmail,
-      message: "Email verified successfully.",
-    };
+    if (
+      typeof body.otp !== 'string' ||
+      !/^\d{6}$/.test(body.otp) ||
+      hash(record.id + body.otp) !== record.otpHash
+    )
+      throw new BadRequestException('Incorrect verification code.');
+    const verificationToken = randomBytes(32).toString('hex');
+    this.proofs.set(hash(verificationToken), {
+      email,
+      eventId: record.eventId,
+      expiresAt: Date.now() + TTL,
+    });
+    record.ready = false;
+    return { verified: true, verificationToken, expiresIn: TTL / 1000 };
   }
-
-  isVerified(email: string) {
-    const normalizedEmail = this.normalizeEmail(email);
-    return this.records.get(normalizedEmail)?.verified === true;
+  assertVerified(eventId: string, body: Record<string, unknown>) {
+    this.cleanup();
+    const email = this.email(body.email);
+    const proof =
+      typeof body.verificationToken === 'string'
+        ? this.proofs.get(hash(body.verificationToken))
+        : undefined;
+    if (!proof || proof.email !== email || proof.eventId !== eventId)
+      throw new ForbiddenException('Verify your email before registering.');
   }
 }

@@ -6,8 +6,11 @@ import { scryptSync } from 'node:crypto';
 import { AppModule } from '../src/app.module.js';
 import { AppService } from '../src/app.service.js';
 import { configure } from '../src/configure.js';
+import { EmailTransport } from '../src/email.service.js';
+import { TestEmailTransport, verifiedGuest } from './verification-helper.js';
 describe('ticket API security and workflow', () => {
   let app: NestExpressApplication;
+  let transport: TestEmailTransport;
   const origin = 'http://localhost:3000';
   const password = 'test-password-unique-for-tests';
   const details = {
@@ -20,8 +23,17 @@ describe('ticket API security and workflow', () => {
     name: 'Guest',
     email: 'guest@example.com',
     phone: '+91 9876543210',
+    aadhaar: '123456789012',
   };
   beforeEach(async () => {
+    vi.stubEnv('EMAIL_ENABLED', 'true');
+    vi.stubEnv('SMTP_HOST', 'smtp.example.com');
+    vi.stubEnv('SMTP_PORT', '587');
+    vi.stubEnv('SMTP_SECURE', 'false');
+    vi.stubEnv('SMTP_USER', 'test-only');
+    vi.stubEnv('SMTP_PASS', 'test-only');
+    vi.stubEnv('EMAIL_FROM', 'test@example.com');
+    transport = new TestEmailTransport();
     process.env.DATABASE_PATH = ':memory:';
     process.env.ADMIN_EMAIL = 'admin@example.com';
     const salt = 'a'.repeat(32);
@@ -30,7 +42,10 @@ describe('ticket API security and workflow', () => {
     process.env.APP_ORIGIN = origin;
     const module = await Test.createTestingModule({
       imports: [AppModule],
-    }).compile();
+    })
+      .overrideProvider(EmailTransport)
+      .useValue(transport)
+      .compile();
     app = module.createNestApplication<NestExpressApplication>({
       rawBody: true,
     });
@@ -39,6 +54,7 @@ describe('ticket API security and workflow', () => {
   });
   afterEach(async () => {
     await app.close();
+    vi.unstubAllEnvs();
   });
   async function login() {
     const res = await request(app.getHttpServer())
@@ -63,6 +79,51 @@ describe('ticket API security and workflow', () => {
       .set('Cookie', 'ticket_session=forged')
       .expect(401);
   });
+  it('rejects unverified, forged, and mismatched proofs on free and paid entrypoints', async () => {
+    const event = app.get(AppService).create(details);
+    for (const route of ['registrations', 'orders']) {
+      for (const verificationToken of [undefined, 'forged']) {
+        await request(app.getHttpServer())
+          .post(`/api/events/${event.id}/${route}`)
+          .set('Origin', origin)
+          .send({ ...guest, verificationToken })
+          .expect(403);
+      }
+    }
+    const verificationToken = await verifiedGuest(
+      app,
+      transport,
+      event.id,
+      guest.email,
+    );
+    const other = app
+      .get(AppService)
+      .create({ ...details, name: 'Other event' });
+    for (const route of ['registrations', 'orders']) {
+      await request(app.getHttpServer())
+        .post(`/api/events/${other.id}/${route}`)
+        .set('Origin', origin)
+        .send({ ...guest, verificationToken })
+        .expect(403);
+      await request(app.getHttpServer())
+        .post(`/api/events/${event.id}/${route}`)
+        .set('Origin', origin)
+        .send({ ...guest, email: 'other@example.com', verificationToken })
+        .expect(403);
+    }
+    for (const route of ['send', 'verify']) {
+      await request(app.getHttpServer())
+        .post(`/api/email-verification/${route}`)
+        .set('Origin', origin)
+        .send({})
+        .expect(400);
+      await request(app.getHttpServer())
+        .post(`/api/email-verification/${route}`)
+        .set('Origin', 'https://evil.example')
+        .send({ email: guest.email, eventId: event.id })
+        .expect(403);
+    }
+  });
   it('creates an event, registers from a separate browser, and revokes logout', async () => {
     const cookie = await login();
     const event = await request(app.getHttpServer())
@@ -74,10 +135,22 @@ describe('ticket API security and workflow', () => {
     await request(app.getHttpServer())
       .get('/api/events/' + event.body.id)
       .expect(200);
+    const verificationToken = await verifiedGuest(
+      app,
+      transport,
+      event.body.id,
+      guest.email,
+    );
+    const otherToken = await verifiedGuest(
+      app,
+      transport,
+      event.body.id,
+      'another@example.com',
+    );
     const registration = await request(app.getHttpServer())
       .post('/api/events/' + event.body.id + '/registrations')
       .set('Origin', origin)
-      .send(guest)
+      .send({ ...guest, verificationToken })
       .expect(201);
     expect(registration.body.id).toBeTruthy();
     const emails = await request(app.getHttpServer())
@@ -90,18 +163,24 @@ describe('ticket API security and workflow', () => {
     await request(app.getHttpServer())
       .post('/api/events/' + event.body.id + '/registrations')
       .set('Origin', origin)
-      .send(guest)
+      .send({ ...guest, verificationToken })
       .expect(409);
     await request(app.getHttpServer())
       .post('/api/events/' + event.body.id + '/registrations')
       .set('Origin', origin)
-      .send({ ...guest, email: 'another@example.com' })
+      .send({
+        ...guest,
+        email: 'another@example.com',
+        verificationToken: otherToken,
+      })
       .expect(409);
     const people = await request(app.getHttpServer())
       .get('/api/registrations')
       .set('Cookie', cookie)
       .expect(200);
     expect(people.body).toHaveLength(1);
+    expect(people.body[0].aadhaar).toBe(guest.aadhaar);
+    expect(registration.body.aadhaar).toBeUndefined();
     const publicData = await request(app.getHttpServer())
       .get('/api/events')
       .expect(200);

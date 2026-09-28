@@ -12,6 +12,7 @@ import {
   field,
   email,
   eventAmount,
+  aadhaarNumber,
   type EventRow,
 } from './app.service.js';
 import { MongoBookings } from './mongo-bookings.js';
@@ -25,6 +26,7 @@ type Registration = {
   name: string;
   email: string;
   phone: string;
+  aadhaar?: string | null;
   createdAt: string;
 };
 export class MongoService {
@@ -173,6 +175,7 @@ export class MongoService {
   async register(eventId: string, body: Record<string, unknown>) {
     const name = field(body, 'name', 120),
       address = email(body),
+      aadhaar = aadhaarNumber(body),
       phone = field(body, 'phone', 24);
     if (!/^[+\d ()-]{7,24}$/.test(phone))
       throw new BadRequestException('Invalid phone number');
@@ -212,6 +215,7 @@ export class MongoService {
               name,
               email: address,
               phone,
+              aadhaar,
               createdAt: new Date().toISOString(),
             },
             { session },

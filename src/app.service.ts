@@ -55,6 +55,14 @@ export function email(body: Record<string, unknown>) {
     throw new BadRequestException('Invalid email');
   return value;
 }
+export function aadhaarNumber(body: Record<string, unknown>) {
+  const value = body?.aadhaar;
+  if (typeof value !== 'string' || !/^[0-9]{12}$/.test(value))
+    throw new BadRequestException(
+      'Aadhaar number must contain exactly 12 digits',
+    );
+  return value;
+}
 export type EventRow = {
   id: string;
   name: string;
@@ -83,6 +91,12 @@ export class AppService implements OnModuleDestroy {
       CREATE TABLE IF NOT EXISTS registrations (id TEXT PRIMARY KEY, eventId TEXT NOT NULL REFERENCES events(id), name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL, createdAt TEXT NOT NULL, UNIQUE(eventId,email));
       CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, expires INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS limits (key TEXT PRIMARY KEY, count INTEGER NOT NULL, expires INTEGER NOT NULL);`);
+    // Existing registrations predate this field and remain readable.
+    const columns = this.db
+      .prepare('PRAGMA table_info(registrations)')
+      .all() as { name: string }[];
+    if (!columns.some((column) => column.name === 'aadhaar'))
+      this.db.exec('ALTER TABLE registrations ADD COLUMN aadhaar TEXT');
     this.outbox = new SqliteEmailOutbox(this.db);
     this.bookings = new SqliteBookings(this.db, this.outbox);
   }
@@ -178,6 +192,7 @@ export class AppService implements OnModuleDestroy {
   register(eventId: string, body: Record<string, unknown>) {
     const name = field(body, 'name', 120),
       address = email(body),
+      aadhaar = aadhaarNumber(body),
       phone = field(body, 'phone', 24);
     if (!/^[+\d ()-]{7,24}$/.test(phone))
       throw new BadRequestException('Invalid phone number');
@@ -198,8 +213,18 @@ export class AppService implements OnModuleDestroy {
         throw new ConflictException('This event is full');
       const id = randomUUID();
       this.db
-        .prepare('INSERT INTO registrations VALUES (?,?,?,?,?,?)')
-        .run(id, eventId, name, address, phone, new Date().toISOString());
+        .prepare(
+          'INSERT INTO registrations (id,eventId,name,email,phone,createdAt,aadhaar) VALUES (?,?,?,?,?,?,?)',
+        )
+        .run(
+          id,
+          eventId,
+          name,
+          address,
+          phone,
+          new Date().toISOString(),
+          aadhaar,
+        );
       this.outbox.enqueue(emailJob(event, { id, name, email: address }));
       this.db.exec('COMMIT');
       return { id, eventName: event.name };

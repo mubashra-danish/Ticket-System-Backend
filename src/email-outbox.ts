@@ -23,11 +23,13 @@ export type EmailJob = {
   request: string | null;
   providerId: string | null;
   lastError: string | null;
+  smtpStartedAt?: number | null;
 };
 export interface EmailOutbox {
   get(id: string): Promise<EmailJob | null>;
   claim(): Promise<EmailJob | null>;
   prepare(job: EmailJob, request: string): Promise<boolean>;
+  beginSend(job: EmailJob): Promise<boolean>;
   complete(job: EmailJob, providerId: string): Promise<void>;
   fail(job: EmailJob, error: string, terminal: boolean): Promise<void>;
   cancel(job: EmailJob): Promise<void>;
@@ -62,6 +64,7 @@ export function emailJob(
     request: null,
     providerId: null,
     lastError: null,
+    smtpStartedAt: null,
   };
 }
 export const RETRY_WINDOW = 23 * 60 * 60 * 1000;

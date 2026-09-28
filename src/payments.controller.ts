@@ -14,16 +14,20 @@ import { AppService } from './app.service.js';
 import type { MongoService } from './mongo.service.js';
 import { sessionToken } from './app.controller.js';
 import { PaymentsService } from './payments.service.js';
+import { EmailVerificationService } from './email-verification.service.js';
 @Controller('api')
 export class PaymentsController {
   constructor(
     @Inject(PaymentsService) private readonly payments: PaymentsService,
     @Inject(AppService) private readonly store: AppService | MongoService,
+    @Inject(EmailVerificationService)
+    private readonly verification: EmailVerificationService,
   ) {}
   @Post('events/:id/orders') create(
     @Param('id') id: string,
     @Body() body: Record<string, unknown>,
   ) {
+    this.verification.assertVerified(id, body);
     return this.payments.create(id, body);
   }
   @Post('payments/status') @HttpCode(200) status(

@@ -10,12 +10,17 @@ export class SqliteEmailOutbox implements EmailOutbox {
   constructor(private readonly db: DatabaseSync) {
     db.exec(`CREATE TABLE IF NOT EXISTS email_outbox(id TEXT PRIMARY KEY,payload TEXT NOT NULL,status TEXT NOT NULL,createdAt INTEGER NOT NULL,nextAttempt INTEGER NOT NULL,attempts INTEGER NOT NULL,firstAttempt INTEGER,leaseUntil INTEGER NOT NULL,leaseToken TEXT,request TEXT,providerId TEXT,lastError TEXT);
  CREATE INDEX IF NOT EXISTS email_outbox_due ON email_outbox(status,nextAttempt,leaseUntil);`);
+    const columns = db.prepare('PRAGMA table_info(email_outbox)').all() as {
+      name: string;
+    }[];
+    if (!columns.some((c) => c.name === 'smtpStartedAt'))
+      db.exec('ALTER TABLE email_outbox ADD COLUMN smtpStartedAt INTEGER');
   }
   // Called synchronously inside the registration/payment transaction.
   enqueue(job: EmailJob) {
     this.db
       .prepare(
-        'INSERT OR IGNORE INTO email_outbox VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        'INSERT OR IGNORE INTO email_outbox (id,payload,status,createdAt,nextAttempt,attempts,firstAttempt,leaseUntil,leaseToken,request,providerId,lastError) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
       )
       .run(
         job.id,
@@ -60,14 +65,14 @@ export class SqliteEmailOutbox implements EmailOutbox {
   async complete(job: EmailJob, providerId: string) {
     this.db
       .prepare(
-        "UPDATE email_outbox SET status='SENT',providerId=?,lastError=NULL,leaseUntil=0,leaseToken=NULL,request=NULL WHERE id=? AND status='SENDING' AND leaseToken=?",
+        "UPDATE email_outbox SET status='SENT',providerId=?,lastError=NULL,leaseUntil=0,leaseToken=NULL,request=NULL,smtpStartedAt=NULL WHERE id=? AND status='SENDING' AND leaseToken=?",
       )
       .run(providerId, job.id, job.leaseToken);
   }
   async fail(job: EmailJob, error: string, terminal: boolean) {
     this.db
       .prepare(
-        "UPDATE email_outbox SET status=?,lastError=?,nextAttempt=?,leaseUntil=0,leaseToken=NULL WHERE id=? AND status='SENDING' AND leaseToken=?",
+        "UPDATE email_outbox SET status=?,lastError=?,nextAttempt=?,leaseUntil=0,leaseToken=NULL,smtpStartedAt=NULL WHERE id=? AND status='SENDING' AND leaseToken=?",
       )
       .run(
         terminal ? 'FAILED' : 'PENDING',
@@ -83,6 +88,15 @@ export class SqliteEmailOutbox implements EmailOutbox {
         "UPDATE email_outbox SET status='CANCELLED',request=NULL,leaseUntil=0,leaseToken=NULL WHERE id=? AND status='SENDING' AND leaseToken=?",
       )
       .run(job.id, job.leaseToken);
+  }
+  async beginSend(job: EmailJob) {
+    return (
+      this.db
+        .prepare(
+          "UPDATE email_outbox SET smtpStartedAt=? WHERE id=? AND status='SENDING' AND leaseToken=? AND leaseUntil>? AND smtpStartedAt IS NULL",
+        )
+        .run(Date.now(), job.id, job.leaseToken, Date.now()).changes === 1
+    );
   }
   async list() {
     return this.db

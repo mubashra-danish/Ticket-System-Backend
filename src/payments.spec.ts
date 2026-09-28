@@ -8,6 +8,7 @@ describe('manual UPI payment approval', () => {
     name: 'Guest',
     email: 'guest@example.com',
     phone: '9876543210',
+    aadhaar: '123456789012',
   };
   const ref = '123456789012';
   const decision = (reference = ref) => ({

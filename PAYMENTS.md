@@ -15,7 +15,7 @@ There is deliberately no default receiving account. Paid event creation and new 
 
 ## Customer flow
 
-1. Enter attendee details. The server fixes the event price and creates a private booking with a 30-minute seat hold (or until the event starts).
+1. Enter attendee details and verify the email address with the emailed code. The server then fixes the event price and creates a private booking with a 30-minute seat hold (or until the event starts). Email verification requires the configuration in [EMAIL.md](EMAIL.md).
 2. Scan the UPI QR or open the UPI app, check the recipient, and transfer the exact amount once.
 3. Enter the 12-digit UPI transaction reference (UTR/RRN). This is an unverified claim. No registration, ticket or confirmation email is issued yet.
 4. The customer sees a friendly awaiting-verification message. They can refresh status in the same browser tab. The page polls briefly and also has a manual status button.
