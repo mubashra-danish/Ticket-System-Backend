@@ -67,8 +67,12 @@ export class MongoService {
         .collection('limits')
         .createIndex({ expires: 1 }, { expireAfterSeconds: 0 });
       return service;
-    } catch {
+    } catch(error) {
       await client?.close();
+       console.error('================ MONGODB ERROR ================');
+  console.error(error);
+  console.error('=================================================');
+
       throw new Error(
         'MongoDB setup failed. Check the saved URI, database user permissions, network access, and replica set support (Atlas is supported).',
       );

@@ -6,18 +6,23 @@ import { PaymentsService } from './payments.service.js';
 import { PaymentsController } from './payments.controller.js';
 import { EmailService, EmailTransport } from './email.service.js';
 import { EmailController } from './email.controller.js';
+import { EmailVerificationController } from "./email-verification.controller.js";
+import { EmailVerificationService } from "./email-verification.service.js";
 export function createStore() {
   const uri =
     process.env.MONGODB_URI || process.env.MONGO_URL || process.env.MONGO_URI;
   return uri ? MongoService.connect(uri) : new AppService();
 }
 @Module({
-  controllers: [AppController, PaymentsController, EmailController],
+  controllers: [AppController, PaymentsController, EmailController, EmailVerificationController
+],
   providers: [
     { provide: AppService, useFactory: createStore },
     PaymentsService,
     EmailService,
     EmailTransport,
+    EmailVerificationService,
+
   ],
 })
 export class AppModule {}
